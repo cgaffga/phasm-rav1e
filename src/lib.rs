@@ -85,7 +85,16 @@ mod cpu_features;
 mod activity;
 pub(crate) mod asm;
 mod dist;
-mod ec;
+// phasm-stego patch: `pub` so downstream stego consumers (phasm-core)
+// can implement `Writer` + `StorageBackend` and reuse `WriterRecorder`
+// for Pass 1 record / Pass 2 cached-replay per
+// docs/design/video/av1/streaming-session.md.
+//
+// Upstream is `mod ec;` (private). The trait + struct visibility
+// inside the module (Writer, StorageBackend, WriterRecorder,
+// WriterEncoder, WriterCounter, WriterCheckpoint) is already `pub`;
+// only the module declaration needs widening.
+pub mod ec;
 mod partition;
 mod predict;
 mod quantize;
