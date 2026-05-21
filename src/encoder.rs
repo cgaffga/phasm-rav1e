@@ -3818,6 +3818,7 @@ fn encode_tile_group_with_phasm_tee<T: Pixel>(
         storage: w.phasm_storage().to_vec(),
         bit_positions: w.phasm_bit_positions().to_vec(),
         bit_tags: w.phasm_bit_tags().to_vec(),
+        bit_meta: w.phasm_bit_meta().to_vec(),
       };
       ((w.done(), recording), stats)
     })
@@ -3912,7 +3913,7 @@ fn encode_tile_group_with_phasm_tee<T: Pixel>(
 /// after `replay_with_overrides` produces stego tile bytes.
 pub fn encode_frame_with_phasm_tee<T: Pixel>(
   fi: &FrameInvariants<T>, fs: &mut FrameState<T>, inter_cfg: &InterConfig,
-) -> (Vec<u8>, crate::ec::PhasmFrameRecording) {
+) -> (Vec<u8>, crate::ec::PhasmFrameRecording<T>) {
   use crate::ec::PhasmFrameRecording;
   debug_assert!(!fi.is_show_existing_frame());
   let obu_extension = 0;
@@ -3975,12 +3976,20 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
   let tile_group_len = tile_group.len();
   packet.write_all(&tile_group).unwrap();
 
+  // Phase B.1.1: capture the post-LR reconstructed frame as a shared
+  // Arc snapshot. `fs.rec` has gone through deblock + CDEF + LR
+  // earlier in encode_tile_group_with_phasm_tee (call below; happens
+  // BEFORE we get here since the tile group has already been built).
+  // Arc::clone is a refcount bump — no data copy. Phasm-core's
+  // J-UNIWARD cost computation reads from this snapshot.
   let recording = PhasmFrameRecording {
     tiles: tile_recordings,
     tile_group_offset,
     tile_group_len,
     frame_header_len,
     frame_obu_start,
+    reconstructed_planes: std::sync::Arc::clone(&fs.rec),
+    frame_qindex: fi.base_q_idx,
   };
   (packet, recording)
 }

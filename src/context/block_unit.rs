@@ -1852,8 +1852,31 @@ impl ContextWriter<'_> {
     self.encode_coeffs(
       coeffs, levels, scan, eob, tx_size, tx_class, txs_ctx, plane_type, w,
     );
-    let cul_level =
-      self.encode_coeff_signs(coeffs, w, plane_type, txb_ctx, cul_level);
+    // phasm-stego (Phase B.1.1): compute the block-level meta base
+    // (plane + pixel-coord + TX shape + tx_type). encode_coeff_signs
+    // sets the per-emission scan_pos on top of this base and calls
+    // w.phasm_set_meta() just before each AC sign emission.
+    //
+    // Pixel coords are PER-PLANE (already chroma-subsampled).
+    // BLOCK_TO_PLANE_SHIFT == 2 (each block unit = 4 luma pixels).
+    let block_meta_base = crate::ec::AcSignMeta {
+      plane: plane as u8,
+      plane_px_x: ((bo.0.x >> xdec) << BLOCK_TO_PLANE_SHIFT) as u16,
+      plane_px_y: ((bo.0.y >> ydec) << BLOCK_TO_PLANE_SHIFT) as u16,
+      tx_width_log2: tx_size.width_log2() as u8,
+      tx_height_log2: tx_size.height_log2() as u8,
+      tx_type: tx_type as u8,
+      scan_pos: 0, // overwritten per emission inside encode_coeff_signs
+    };
+    let cul_level = self.encode_coeff_signs(
+      coeffs,
+      scan,
+      w,
+      plane_type,
+      txb_ctx,
+      cul_level,
+      block_meta_base,
+    );
     self.bc.set_coeff_context(plane, bo, tx_size, xdec, ydec, cul_level as u8);
     true
   }
@@ -1981,8 +2004,9 @@ impl ContextWriter<'_> {
   }
 
   fn encode_coeff_signs<T: Coefficient, W: Writer>(
-    &mut self, coeffs: &[T], w: &mut W, plane_type: usize, txb_ctx: TXB_CTX,
-    orig_cul_level: u32,
+    &mut self, coeffs: &[T], scan: &[u16], w: &mut W, plane_type: usize,
+    txb_ctx: TXB_CTX, orig_cul_level: u32,
+    block_meta_base: crate::ec::AcSignMeta,
   ) -> u32 {
     // Loop to code all signs in the transform block,
     // starting with the sign of DC (if applicable)
@@ -2009,6 +2033,15 @@ impl ContextWriter<'_> {
         // WriterRecorder (encoder.rs:3497), the tag travels through
         // WriterRecorder::replay (ec.rs) which propagates
         // phasm_set_tag + phasm_track_bit to the destination.
+        //
+        // Phase B.1.1: also set per-emission spatial metadata so
+        // phasm-core can map this cover bit to (plane, pixel-coord,
+        // transform-shape, scan-position) for J-UNIWARD cost compute.
+        // scan_pos = scan[c] — the raster-grid index of this coeff
+        // within the TX block (freq_y * tx_width + freq_x).
+        let mut meta = block_meta_base;
+        meta.scan_pos = scan[c];
+        w.phasm_set_meta(meta);
         w.phasm_set_tag(crate::ec::PHASM_TAG_AC_COEFF_SIGN);
         w.bit(sign as u16);
         w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);

@@ -107,6 +107,26 @@ pub trait Writer {
   /// one or more 50/50 symbols, then reset to `PHASM_TAG_OTHER`.
   #[inline]
   fn phasm_set_tag(&mut self, _tag: u8) {}
+
+  /// phasm-stego (Phase B.1.1, 2026-05-21): set the per-AC-sign-
+  /// emission spatial metadata. Recorded by the `WriterRecorder` /
+  /// `WriterTee` backends alongside the position + tag. No-op for
+  /// other backends. Default no-op on the trait so most Writer
+  /// impls don't need to provide it.
+  ///
+  /// Set ONLY when emitting an AC sign (i.e., when also calling
+  /// `phasm_set_tag(PHASM_TAG_AC_COEFF_SIGN)`); other emission
+  /// classes don't read the meta. Like `phasm_set_tag` the value
+  /// is sticky — caller should set per-emission rather than
+  /// per-block, since each AC sign has a distinct `scan_pos`.
+  ///
+  /// Used by `encode_coeff_signs` (block_unit.rs) so phasm-core can
+  /// map each cover bit to a (plane, pixel-coord, transform-shape,
+  /// scan-position) tuple for J-UNIWARD cost evaluation. See
+  /// `phasm-av1/docs/design/video/av1/phase-b-uniward-cascade.md`
+  /// § 3 for the contract.
+  #[inline]
+  fn phasm_set_meta(&mut self, _meta: AcSignMeta) {}
 }
 
 /// `StorageBackend` is an internal trait used to tie a specific `Writer`
@@ -146,6 +166,12 @@ pub trait StorageBackend {
   /// AcCoeffSign-only ship-gate (channel-design.md § 6).
   #[inline]
   fn phasm_set_tag(&mut self, _tag: u8) {}
+
+  /// phasm-stego (Phase B.1.1): set spatial metadata for the next
+  /// AC sign emission. See [`Writer::phasm_set_meta`]. Default no-op
+  /// for non-Recorder backends.
+  #[inline]
+  fn phasm_set_meta(&mut self, _meta: AcSignMeta) {}
 }
 
 // phasm-stego (W3.9.0): per-channel emission tags. Values are
@@ -154,6 +180,51 @@ pub trait StorageBackend {
 pub const PHASM_TAG_OTHER: u8 = 0;
 pub const PHASM_TAG_AC_COEFF_SIGN: u8 = 1;
 pub const PHASM_TAG_GOLOMB_TAIL_LSB: u8 = 2;
+
+/// phasm-stego (Phase B.1.1, 2026-05-21): per-AC-sign-emission
+/// spatial metadata. Recorded alongside `phasm_bit_positions` /
+/// `phasm_bit_tags`, only meaningful when the parallel tag is
+/// `PHASM_TAG_AC_COEFF_SIGN`. Other tag values get zero-initialized
+/// meta (not read by phasm-core).
+///
+/// Used by phasm-core's `compute_av1_uniward_costs` to map a cover
+/// bit (sequential position in the entropy stream) back to a
+/// (plane, pixel-coord, transform-shape, scan-position) tuple so
+/// J-UNIWARD's wavelet kernel can evaluate per-flip cost on the
+/// post-LR reconstructed pixel patch.
+///
+/// See `phasm-av1/docs/design/video/av1/phase-b-uniward-cascade.md`
+/// § 3 (spatial metadata extension) for the integration contract.
+///
+/// Pixel coordinates are PER-PLANE (i.e., already account for
+/// chroma subsampling): `plane_px_x` is in the plane buffer's own
+/// coordinate system, ready to index into `reconstructed_planes[
+/// plane].data`. Frame-relative, not tile-relative (v0.3-AV1 is
+/// single-tile so the two are equivalent; multi-tile lands v0.8+).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcSignMeta {
+  /// 0 = Y, 1 = U, 2 = V.
+  pub plane: u8,
+  /// Top-left pixel x-coord of the transform block in this plane's
+  /// pixel buffer. Already chroma-subsampled for plane=1/2.
+  pub plane_px_x: u16,
+  /// Top-left pixel y-coord (same convention as `plane_px_x`).
+  pub plane_px_y: u16,
+  /// log2 of the transform width in pixels. AV1 TX widths are
+  /// 4 / 8 / 16 / 32 / 64 → log2 = 2 / 3 / 4 / 5 / 6.
+  pub tx_width_log2: u8,
+  /// log2 of the transform height. AV1 supports rectangular TX
+  /// shapes (e.g., 8×16 with width_log2=3 and height_log2=4).
+  pub tx_height_log2: u8,
+  /// AV1 `TxType` enum value (0..15) — DCT_DCT / ADST_DCT / ... /
+  /// IDTX / FLIPADST_FLIPADST etc. Used by phasm-core to look up
+  /// the per-transform-type impulse basis for J-UNIWARD.
+  pub tx_type: u8,
+  /// Raster-grid (frequency-domain) index of this coefficient within
+  /// the TX block. `scan_pos = freq_y * tx_width + freq_x`. Used to
+  /// look up the corresponding DCT basis vector for cost computation.
+  pub scan_pos: u16,
+}
 
 /// phasm-stego (W3.10.4): per-tile recorder snapshot extracted from
 /// a `WriterTee` after `encode_tile` finishes. Returned to phasm-core
@@ -171,6 +242,15 @@ pub struct PhasmTileRecording {
   /// Per-emission channel tag (`PHASM_TAG_*`), parallel to
   /// `bit_positions`.
   pub bit_tags: Vec<u8>,
+  /// Phase B.1.1: per-emission spatial metadata for AC sign
+  /// emissions, parallel to `bit_positions` and `bit_tags`. Only
+  /// meaningful where `bit_tags[i] == PHASM_TAG_AC_COEFF_SIGN`;
+  /// other entries are zero-initialized. Used by phasm-core's
+  /// J-UNIWARD cost computation to map cover bits to per-plane
+  /// reconstructed-pixel patches. See
+  /// `phasm-av1/docs/design/video/av1/phase-b-uniward-cascade.md`
+  /// § 3 for the contract.
+  pub bit_meta: Vec<AcSignMeta>,
 }
 
 /// phasm-stego (W3.10.4): full-frame recording metadata returned from
@@ -179,7 +259,7 @@ pub struct PhasmTileRecording {
 /// tile_group bytes start within the OBU-wrapped packet — needed by
 /// phasm-core to splice stego tile bytes into the natural packet.
 #[derive(Debug, Clone)]
-pub struct PhasmFrameRecording {
+pub struct PhasmFrameRecording<T: crate::util::Pixel = u8> {
   /// Per-tile recorder snapshot, in tile-emission order (matches
   /// `build_raw_tile_group` order).
   pub tiles: Vec<PhasmTileRecording>,
@@ -209,6 +289,25 @@ pub struct PhasmFrameRecording {
   ///   `[tile_group_offset .. tile_group_offset + tile_group_len]: tile_group`
   /// v0.4 addition: paired with `frame_header_len` for OBU rebuild.
   pub frame_obu_start: usize,
+  /// Phase B.1.1 addition: post-LR (final) reconstructed-pixel frame
+  /// captured at the end of `encode_frame_with_phasm_tee` after the
+  /// deblock + CDEF + LR filter chain completes. Phasm-core's
+  /// J-UNIWARD cost computation reads these pixels — they're what
+  /// the decoder will reproduce, so cost-vs-flip evaluation operates
+  /// on the actual view-time domain.
+  ///
+  /// Currently locks T=u8. 10-bit support (T=u16) would require
+  /// parameterizing `PhasmFrameRecording<T>`; deferred to v0.5+ when
+  /// the 10-bit need is concrete.
+  ///
+  /// Memory: shared via `Arc::clone` from `fs.rec` — refcount bump,
+  /// no data copy. 1080p Y+U+V at u8 ≈ 3 MB shared.
+  pub reconstructed_planes: std::sync::Arc<crate::frame::Frame<T>>,
+  /// Phase B.1.1 addition: per-frame base quantizer index
+  /// (`fi.base_q_idx`). v0.5 J-UNIWARD cost normalization needs the
+  /// quantizer step size. Per-block delta-Q variance (when rav1e
+  /// enables it) is deferred to v0.5+.
+  pub frame_qindex: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +359,18 @@ pub struct WriterRecorder {
   /// and pushed to `phasm_bit_tags`. Stays at last-set value until
   /// next `phasm_set_tag` call.
   phasm_current_tag: u8,
+  /// phasm-stego (fork, Phase B.1.1): per-position AC-sign spatial
+  /// metadata, parallel to `phasm_bit_positions` and `phasm_bit_tags`.
+  /// `phasm_bit_meta[i]` is meaningful when `phasm_bit_tags[i] ==
+  /// PHASM_TAG_AC_COEFF_SIGN`; otherwise zero-initialized and unused.
+  /// Memory: 8 bytes/entry; ~200k entries/frame at 1080p → ~1.6
+  /// MB/frame, ~48 MB/GOP. Acceptable for v0.5+ J-UNIWARD cost work.
+  phasm_bit_meta: Vec<AcSignMeta>,
+  /// phasm-stego (fork, Phase B.1.1): sticky meta state. Set by
+  /// `phasm_set_meta`; read by `phasm_track_bit` on each invocation
+  /// and pushed to `phasm_bit_meta`. Resets to default zero on
+  /// rollback.
+  phasm_current_meta: AcSignMeta,
 }
 
 #[derive(Debug, Clone)]
@@ -302,13 +413,15 @@ impl Default for WriterCounter {
 /// Constructor for a recording Writer
 impl WriterRecorder {
   #[inline]
-  pub const fn new() -> WriterBase<WriterRecorder> {
+  pub fn new() -> WriterBase<WriterRecorder> {
     WriterBase::new(WriterRecorder {
       storage: Vec::new(),
       bits: 0,
       phasm_bit_positions: Vec::new(),
       phasm_bit_tags: Vec::new(),
       phasm_current_tag: PHASM_TAG_OTHER,
+      phasm_bit_meta: Vec::new(),
+      phasm_current_meta: AcSignMeta::default(),
     })
   }
 }
@@ -322,6 +435,8 @@ impl Default for WriterRecorder {
       phasm_bit_positions: Vec::new(),
       phasm_bit_tags: Vec::new(),
       phasm_current_tag: PHASM_TAG_OTHER,
+      phasm_bit_meta: Vec::new(),
+      phasm_current_meta: AcSignMeta::default(),
     }
   }
 }
@@ -370,6 +485,9 @@ pub struct WriterTee {
   phasm_bit_positions: Vec<(u32, u16)>,
   phasm_bit_tags: Vec<u8>,
   phasm_current_tag: u8,
+  // Phase B.1.1: spatial metadata for AC sign emissions.
+  phasm_bit_meta: Vec<AcSignMeta>,
+  phasm_current_meta: AcSignMeta,
   // === Checkpoint side-state ===
   /// LIFO stack of rollback snapshots. RDO uses nested
   /// checkpoint/rollback cycles; checkpoint pushes a snapshot,
@@ -386,6 +504,8 @@ struct TeeRollbackState {
   bits: usize,
   phasm_bit_positions_len: usize,
   phasm_current_tag: u8,
+  // Phase B.1.1: meta state at checkpoint time.
+  phasm_current_meta: AcSignMeta,
 }
 
 impl WriterTee {
@@ -406,6 +526,8 @@ impl Default for WriterTee {
       phasm_bit_positions: Vec::new(),
       phasm_bit_tags: Vec::new(),
       phasm_current_tag: PHASM_TAG_OTHER,
+      phasm_bit_meta: Vec::new(),
+      phasm_current_meta: AcSignMeta::default(),
       pending_checkpoints: Vec::new(),
     }
   }
@@ -489,6 +611,12 @@ impl StorageBackend for WriterBase<WriterRecorder> {
     // phasm-stego (W3.9.0): phasm_bit_tags is parallel to
     // phasm_bit_positions; truncate to the same length.
     self.s.phasm_bit_tags.truncate(pt);
+    // phasm-stego (Phase B.1.1): phasm_bit_meta is parallel; truncate
+    // to the same length. current_meta is intentionally NOT reset
+    // because callers (encode_coeff_signs) set it per-emission, so
+    // a stale current_meta during rollback won't be read until the
+    // next phasm_set_meta call by the caller.
+    self.s.phasm_bit_meta.truncate(pt);
   }
   /// phasm-stego (fork): record a 50/50 binary emission. Called from
   /// `Writer::bool` when `f == 16384`, BEFORE the matching `store()`
@@ -497,11 +625,14 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   ///
   /// W3.9.0: also records the current `phasm_current_tag` value into
   /// the parallel `phasm_bit_tags` Vec.
+  /// Phase B.1.1: also records the current `phasm_current_meta` into
+  /// the parallel `phasm_bit_meta` Vec.
   #[inline]
   fn phasm_track_bit(&mut self, value: u16) {
     let idx = self.s.storage.len() as u32;
     self.s.phasm_bit_positions.push((idx, value));
     self.s.phasm_bit_tags.push(self.s.phasm_current_tag);
+    self.s.phasm_bit_meta.push(self.s.phasm_current_meta);
   }
   /// phasm-stego (W3.9.0): set the per-channel emission tag. Sticky
   /// state — the next `phasm_track_bit` invocations record this tag
@@ -509,6 +640,15 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   #[inline]
   fn phasm_set_tag(&mut self, tag: u8) {
     self.s.phasm_current_tag = tag;
+  }
+  /// phasm-stego (Phase B.1.1): set the per-AC-sign spatial metadata.
+  /// Sticky state — the next `phasm_track_bit` invocation records
+  /// this meta into the parallel Vec. Caller should reset to default
+  /// after the matching emission (or just set the next emission's
+  /// meta; old value never read after the next phasm_track_bit).
+  #[inline]
+  fn phasm_set_meta(&mut self, meta: AcSignMeta) {
+    self.s.phasm_current_meta = meta;
   }
 }
 
@@ -619,6 +759,7 @@ impl StorageBackend for WriterBase<WriterTee> {
       bits: self.s.bits,
       phasm_bit_positions_len: self.s.phasm_bit_positions.len(),
       phasm_current_tag: self.s.phasm_current_tag,
+      phasm_current_meta: self.s.phasm_current_meta,
     });
     WriterCheckpoint {
       stream_size: 0, // unused for Tee
@@ -645,6 +786,9 @@ impl StorageBackend for WriterBase<WriterTee> {
     self.s.phasm_bit_positions.truncate(snap.phasm_bit_positions_len);
     self.s.phasm_bit_tags.truncate(snap.phasm_bit_positions_len);
     self.s.phasm_current_tag = snap.phasm_current_tag;
+    // Phase B.1.1: meta parallel + sticky restore.
+    self.s.phasm_bit_meta.truncate(snap.phasm_bit_positions_len);
+    self.s.phasm_current_meta = snap.phasm_current_meta;
     // Pop this checkpoint AND any later ones (LIFO).
     self.s.pending_checkpoints.truncate(idx);
   }
@@ -653,10 +797,15 @@ impl StorageBackend for WriterBase<WriterTee> {
     let idx = self.s.storage.len() as u32;
     self.s.phasm_bit_positions.push((idx, value));
     self.s.phasm_bit_tags.push(self.s.phasm_current_tag);
+    self.s.phasm_bit_meta.push(self.s.phasm_current_meta);
   }
   #[inline]
   fn phasm_set_tag(&mut self, tag: u8) {
     self.s.phasm_current_tag = tag;
+  }
+  #[inline]
+  fn phasm_set_meta(&mut self, meta: AcSignMeta) {
+    self.s.phasm_current_meta = meta;
   }
 }
 
@@ -722,6 +871,15 @@ impl WriterBase<WriterTee> {
   #[inline]
   pub fn phasm_bit_tags(&self) -> &[u8] {
     &self.s.phasm_bit_tags
+  }
+
+  /// Phase B.1.1: borrow recorder-side per-emission spatial metadata.
+  /// Parallel to `phasm_bit_positions` / `phasm_bit_tags`. Only the
+  /// entries where the parallel tag is `PHASM_TAG_AC_COEFF_SIGN` are
+  /// meaningful; others are zero-initialized.
+  #[inline]
+  pub fn phasm_bit_meta(&self) -> &[AcSignMeta] {
+    &self.s.phasm_bit_meta
   }
 }
 
@@ -856,32 +1014,48 @@ impl WriterBase<WriterRecorder> {
     // 2655 (enc=GOLOMB, dec=OTHER) + 56 (enc=AC, dec=OTHER) tag
     // mismatches were ALL from this leftover-tag leak on the
     // encoder side over-tagging non-coefficient bits.
+    // Phase B.1.1: also zip phasm_bit_meta so spatial metadata
+    // propagates to the destination alongside tag + value. Three
+    // parallel Vecs walk in lockstep; their invariant is
+    // .len() == phasm_bit_positions.len().
+    debug_assert_eq!(
+      self.s.phasm_bit_positions.len(),
+      self.s.phasm_bit_tags.len()
+    );
+    debug_assert_eq!(
+      self.s.phasm_bit_positions.len(),
+      self.s.phasm_bit_meta.len()
+    );
     let mut bit_iter = self
       .s
       .phasm_bit_positions
       .iter()
       .zip(self.s.phasm_bit_tags.iter())
+      .zip(self.s.phasm_bit_meta.iter())
       .peekable();
     for (i, &(fl, fh, nms)) in self.s.storage.iter().enumerate() {
-      if let Some(&(&(bit_idx, bit_val), &tag)) = bit_iter.peek() {
+      if let Some(&((&(bit_idx, bit_val), &tag), &meta)) = bit_iter.peek() {
         if bit_idx as usize == i {
           bit_iter.next();
           dest.phasm_set_tag(tag);
+          dest.phasm_set_meta(meta);
           dest.phasm_track_bit(bit_val);
         }
       }
       dest.store(fl, fh, nms);
     }
-    // CRITICAL: reset dest's tag to OTHER so subsequent direct
-    // writes (write_cdef, write_lrf, etc.) don't inherit the
-    // last replayed bit's tag.
+    // CRITICAL: reset dest's tag + meta to default so subsequent
+    // direct writes (write_cdef, write_lrf, etc.) don't inherit
+    // the last replayed bit's state.
     dest.phasm_set_tag(PHASM_TAG_OTHER);
+    dest.phasm_set_meta(AcSignMeta::default());
     self.rng = 0x8000;
     self.cnt = -9;
     self.s.storage.truncate(0);
     self.s.bits = 0;
     self.s.phasm_bit_positions.truncate(0);
     self.s.phasm_bit_tags.truncate(0);
+    self.s.phasm_bit_meta.truncate(0);
   }
 
   /// phasm-stego (fork): borrow recorded storage tuples without
@@ -908,6 +1082,14 @@ impl WriterBase<WriterRecorder> {
   #[inline]
   pub fn phasm_bit_tags(&self) -> &[u8] {
     &self.s.phasm_bit_tags
+  }
+
+  /// Phase B.1.1: borrow per-emission spatial metadata. Same parallel
+  /// indexing convention as `phasm_bit_tags`. Only meaningful where
+  /// the parallel tag is `PHASM_TAG_AC_COEFF_SIGN`.
+  #[inline]
+  pub fn phasm_bit_meta(&self) -> &[AcSignMeta] {
+    &self.s.phasm_bit_meta
   }
 }
 
@@ -998,6 +1180,11 @@ where
   // StorageBackend trait method.
   fn phasm_set_tag(&mut self, tag: u8) {
     <Self as StorageBackend>::phasm_set_tag(self, tag);
+  }
+  // phasm-stego (Phase B.1.1): Writer trait forwarding to
+  // StorageBackend's phasm_set_meta. Same pattern as phasm_set_tag.
+  fn phasm_set_meta(&mut self, meta: AcSignMeta) {
+    <Self as StorageBackend>::phasm_set_meta(self, meta);
   }
   /// Encode a literal bitstring, bit by bit in MSB order, with flat
   /// probability.
