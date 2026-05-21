@@ -49,6 +49,22 @@ use crate::encoder::*;
 pub use crate::frame::Frame;
 pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 
+// phasm-stego (W3.8.3, Option 3 minimal-API):
+// Re-exports of internal types needed by phasm-core to call
+// `crate::encoder::encode_tile::<WriterRecorder>` directly. See
+// `phasm-av1/docs/design/video/av1/rav1e-hook-sites.md` § 3.
+//
+// TODO(v0.4+ refactor): These re-exports should be replaced by a
+// cleaner Option 1 API (encode_frame_for_pass1 + encode_frame_wrap_obu)
+// that takes the same args as the public Context::receive_packet
+// surface, so phasm-core doesn't depend on these internal types.
+// See rav1e-hook-sites.md § 3.2 + § 9 Q-OPT1.
+pub mod phasm_stego {
+  pub use crate::api::PhasmInterConfig as InterConfig;
+  pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
+  pub use crate::stats::EncoderStats;
+}
+
 pub(crate) mod built_info {
   // The file has been placed there by the build script.
   include!(concat!(env!("OUT_DIR"), "/built.rs"));

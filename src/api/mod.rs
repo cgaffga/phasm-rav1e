@@ -33,4 +33,8 @@ pub use color::*;
 pub use config::*;
 pub use context::*;
 pub(crate) use internal::*;
+// phasm-stego (W3.8.3): selectively re-export InterConfig so the
+// `crate::phasm_stego` mod can route phasm-core callers to it.
+// TODO(v0.4+): drop when the Option 1 refactor lands.
+pub use internal::InterConfig as PhasmInterConfig;
 pub use util::*;

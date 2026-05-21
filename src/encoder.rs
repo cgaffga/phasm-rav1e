@@ -3469,7 +3469,20 @@ fn check_lf_queue<T: Pixel, S>(
 }
 
 #[profiling::function]
-fn encode_tile<'a, T: Pixel, S>(
+// phasm-stego: pub for W3.8 W3.8.5+ phasm-core integration (smoke
+// test path for encode_tile::<WriterRecorder>). See
+// `phasm-av1/docs/design/video/av1/rav1e-hook-sites.md` § 3
+// "Option 3 (minimal)" + § 9 open question Q-OPT1.
+//
+// TODO(W3.8.4 / v0.4+ refactor): replace this minimal pub-encode_tile
+// path with the Option 1 `encode_frame_for_pass1` +
+// `encode_frame_wrap_obu` split (see rav1e-hook-sites.md § 3.2). The
+// Option 3 surface exposes deep internal types (FrameInvariants,
+// FrameState, InterConfig) that callers must construct manually —
+// brittle across upstream rav1e changes. Option 1 takes the same
+// args as Context::receive_packet so phasm-core only depends on the
+// public Context API surface.
+pub fn encode_tile<'a, T: Pixel, S>(
   fi: &FrameInvariants<T>, ts: &'a mut TileStateMut<'_, T>,
   fc: &'a mut CDFContext, blocks: &'a mut TileBlocksMut<'a>,
   inter_cfg: &InterConfig,
