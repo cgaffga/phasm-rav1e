@@ -2076,13 +2076,26 @@ impl ContextWriter<'_> {
         for i in (1..length).rev() {
           w.bit(((x >> i) & 0x01) as u16);
         }
-        // LSB literal bit — THE enrolled position.
-        let mut golomb_meta = block_meta_base;
-        golomb_meta.scan_pos = scan[c];
-        w.phasm_set_meta(golomb_meta);
-        w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
-        w.bit((x & 0x01) as u16);
-        w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
+        // LSB literal bit — enrolled IFF length > 1.
+        //
+        // Edge case: length == 1 means x = 1 (i.e., value = 0,
+        // i.e., level == COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1).
+        // The golomb code is a single "1" bit that doubles as the
+        // leading-zeros terminator AND the literal value. The
+        // decoder can't differentiate it from the terminator
+        // (it's consumed by the leading-zeros loop), so we tag
+        // OTHER on both sides to keep parity. We lose one position
+        // per such coefficient — negligible per B.2.1 spike data.
+        if length > 1 {
+          let mut golomb_meta = block_meta_base;
+          golomb_meta.scan_pos = scan[c];
+          w.phasm_set_meta(golomb_meta);
+          w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
+          w.bit((x & 0x01) as u16);
+          w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
+        } else {
+          w.bit((x & 0x01) as u16);
+        }
       }
     }
 
