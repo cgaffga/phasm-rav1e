@@ -189,6 +189,13 @@ impl WriterCounter {
   }
 }
 
+impl Default for WriterCounter {
+  #[inline]
+  fn default() -> Self {
+    WriterCounter { bits: 0 }
+  }
+}
+
 /// Constructor for a recording Writer
 impl WriterRecorder {
   #[inline]
@@ -201,11 +208,29 @@ impl WriterRecorder {
   }
 }
 
+impl Default for WriterRecorder {
+  #[inline]
+  fn default() -> Self {
+    WriterRecorder {
+      storage: Vec::new(),
+      bits: 0,
+      phasm_bit_positions: Vec::new(),
+    }
+  }
+}
+
 /// Constructor for a encoding Writer
 impl WriterEncoder {
   #[inline]
   pub const fn new() -> WriterBase<WriterEncoder> {
     WriterBase::new(WriterEncoder { precarry: Vec::new(), low: 0 })
+  }
+}
+
+impl Default for WriterEncoder {
+  #[inline]
+  fn default() -> Self {
+    WriterEncoder { precarry: Vec::new(), low: 0 }
   }
 }
 
@@ -350,16 +375,17 @@ impl StorageBackend for WriterBase<WriterEncoder> {
 /// part of the public interface.
 impl<S> WriterBase<S> {
   /// Internal constructor called by the subtypes that implement the
-  /// actual encoder and Recorder.
+  /// actual encoder and Recorder. pub(crate) so generic-S encode-loop
+  /// callers in `src/encoder.rs` can construct via `WriterBase::new(S::default())`.
   #[inline]
   #[cfg(not(feature = "desync_finder"))]
-  const fn new(storage: S) -> Self {
+  pub(crate) const fn new(storage: S) -> Self {
     WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
   }
 
   #[inline]
   #[cfg(feature = "desync_finder")]
-  fn new(storage: S) -> Self {
+  pub(crate) fn new(storage: S) -> Self {
     WriterBase {
       rng: 0x8000,
       cnt: -9,

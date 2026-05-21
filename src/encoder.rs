@@ -3252,7 +3252,9 @@ fn encode_tile_group<T: Pixel>(
     .collect::<Vec<_>>()
     .into_par_iter()
     .map(|(mut ctx, cdf)| {
-      encode_tile(fi, &mut ctx.ts, cdf, &mut ctx.tb, inter_cfg)
+      let (mut w, stats): (WriterBase<WriterEncoder>, _) =
+        encode_tile(fi, &mut ctx.ts, cdf, &mut ctx.tb, inter_cfg);
+      (w.done(), stats)
     })
     .unzip();
 
@@ -3373,13 +3375,15 @@ pub struct SBSQueueEntry {
 }
 
 #[profiling::function]
-fn check_lf_queue<T: Pixel>(
+fn check_lf_queue<T: Pixel, S>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
-  cw: &mut ContextWriter, w: &mut WriterBase<WriterEncoder>,
+  cw: &mut ContextWriter, w: &mut WriterBase<S>,
   sbs_q: &mut VecDeque<SBSQueueEntry>, last_lru_ready: &mut [i32; 3],
   last_lru_rdoed: &mut [i32; 3], last_lru_coded: &mut [i32; 3],
   deblock_p: bool,
-) {
+) where
+  WriterBase<S>: StorageBackend,
+{
   let mut check_queue = true;
   let planes = if fi.sequence.chroma_sampling == ChromaSampling::Cs400 {
     1
@@ -3465,13 +3469,17 @@ fn check_lf_queue<T: Pixel>(
 }
 
 #[profiling::function]
-fn encode_tile<'a, T: Pixel>(
+fn encode_tile<'a, T: Pixel, S>(
   fi: &FrameInvariants<T>, ts: &'a mut TileStateMut<'_, T>,
   fc: &'a mut CDFContext, blocks: &'a mut TileBlocksMut<'a>,
   inter_cfg: &InterConfig,
-) -> (Vec<u8>, EncoderStats) {
+) -> (WriterBase<S>, EncoderStats)
+where
+  WriterBase<S>: StorageBackend,
+  S: Default,
+{
   let mut enc_stats = EncoderStats::default();
-  let mut w = WriterEncoder::new();
+  let mut w: WriterBase<S> = WriterBase::new(S::default());
   let planes =
     if fi.sequence.chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
 
@@ -3667,7 +3675,7 @@ fn encode_tile<'a, T: Pixel>(
     ts.sbo.0.x,
     ts.sbo.0.y
   );
-  (w.done(), enc_stats)
+  (w, enc_stats)
 }
 
 #[allow(unused)]
