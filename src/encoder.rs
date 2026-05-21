@@ -3786,6 +3786,195 @@ fn get_initial_segmentation<T: Pixel>(
 ///
 /// - If the frame packets cannot be written
 #[profiling::function]
+/// phasm-stego (W3.10.4): WriterTee variant of `encode_tile_group`.
+/// Same body modulo the writer backend (WriterTee vs WriterEncoder)
+/// + captures the per-tile recorder snapshot before `.done()` drains
+/// it. Returns (tile_group_bytes, per-tile recorder data).
+fn encode_tile_group_with_phasm_tee<T: Pixel>(
+  fi: &FrameInvariants<T>, fs: &mut FrameState<T>, inter_cfg: &InterConfig,
+) -> (Vec<u8>, Vec<crate::ec::PhasmTileRecording>) {
+  use crate::ec::{PhasmTileRecording, WriterTee};
+  let planes =
+    if fi.sequence.chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
+  let mut blocks = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+  let ti = &fi.sequence.tiling;
+
+  let initial_cdf = get_initial_cdfcontext(fi);
+  let mut cdfs = vec![initial_cdf; ti.tile_count()];
+
+  let (raw_tiles_with_recording, stats): (Vec<_>, Vec<_>) = ti
+    .tile_iter_mut(fs, &mut blocks)
+    .zip(cdfs.iter_mut())
+    .collect::<Vec<_>>()
+    .into_par_iter()
+    .map(|(mut ctx, cdf)| {
+      let (mut w, stats): (WriterBase<WriterTee>, _) =
+        encode_tile(fi, &mut ctx.ts, cdf, &mut ctx.tb, inter_cfg);
+      // Snapshot the recorder BEFORE done() — done() finalizes the
+      // encoder side but the WriterTee state owns the recorder
+      // fields. Cloning is cheap (small Vecs); done() drains precarry
+      // but leaves storage/positions/tags intact.
+      let recording = PhasmTileRecording {
+        storage: w.phasm_storage().to_vec(),
+        bit_positions: w.phasm_bit_positions().to_vec(),
+        bit_tags: w.phasm_bit_tags().to_vec(),
+      };
+      ((w.done(), recording), stats)
+    })
+    .unzip();
+
+  let (raw_tiles, recordings): (Vec<Vec<u8>>, Vec<PhasmTileRecording>) =
+    raw_tiles_with_recording.into_iter().unzip();
+
+  for tile_stats in stats {
+    fs.enc_stats += &tile_stats;
+  }
+
+  // Post-processing (deblock + CDEF + LR) is identical to the
+  // standard encode_tile_group flow — copied verbatim.
+  let levels = fs.apply_tile_state_mut(|ts| {
+    let rec = &mut ts.rec;
+    deblock_filter_optimize(
+      fi,
+      &rec.as_const(),
+      &ts.input.as_tile(),
+      &blocks.as_tile_blocks(),
+      fi.width,
+      fi.height,
+    )
+  });
+  fs.deblock.levels = levels;
+
+  if fs.deblock.levels[0] != 0 || fs.deblock.levels[1] != 0 {
+    fs.apply_tile_state_mut(|ts| {
+      let rec = &mut ts.rec;
+      deblock_filter_frame(
+        ts.deblock,
+        rec,
+        &blocks.as_tile_blocks(),
+        fi.width,
+        fi.height,
+        fi.sequence.bit_depth,
+        planes,
+      );
+    });
+  }
+
+  if fi.sequence.enable_restoration {
+    let deblocked_frame = (*fs.rec).clone();
+
+    if fi.sequence.enable_cdef {
+      fs.apply_tile_state_mut(|ts| {
+        let rec = &mut ts.rec;
+        cdef_filter_tile(fi, &deblocked_frame, &blocks.as_tile_blocks(), rec);
+      });
+    }
+    fs.restoration.lrf_filter_frame(
+      Arc::get_mut(&mut fs.rec).unwrap(),
+      &deblocked_frame,
+      fi,
+    );
+  } else if fi.sequence.enable_cdef {
+    let deblocked_frame = (*fs.rec).clone();
+    fs.apply_tile_state_mut(|ts| {
+      let rec = &mut ts.rec;
+      cdef_filter_tile(fi, &deblocked_frame, &blocks.as_tile_blocks(), rec);
+    });
+  }
+
+  let (idx_max, max_len) = raw_tiles
+    .iter()
+    .map(Vec::len)
+    .enumerate()
+    .max_by_key(|&(_, len)| len)
+    .unwrap();
+
+  if !fi.disable_frame_end_update_cdf {
+    fs.context_update_tile_id = idx_max;
+    fs.cdfs = cdfs[idx_max];
+    fs.cdfs.reset_counts();
+  }
+
+  let max_tile_size_bytes = ILog::ilog(max_len).div_ceil(8) as u32;
+  debug_assert!(max_tile_size_bytes > 0 && max_tile_size_bytes <= 4);
+  fs.max_tile_size_bytes = max_tile_size_bytes;
+
+  (
+    build_raw_tile_group(ti, &raw_tiles, max_tile_size_bytes),
+    recordings,
+  )
+}
+
+/// phasm-stego (W3.10.4): WriterTee variant of `encode_frame`.
+/// Returns (packet bytes, `PhasmFrameRecording`). The recording's
+/// `tile_group_offset` field tells phasm-core where in the packet
+/// the tile_group bytes start — needed for the byte-splice step
+/// after `replay_with_overrides` produces stego tile bytes.
+pub fn encode_frame_with_phasm_tee<T: Pixel>(
+  fi: &FrameInvariants<T>, fs: &mut FrameState<T>, inter_cfg: &InterConfig,
+) -> (Vec<u8>, crate::ec::PhasmFrameRecording) {
+  use crate::ec::PhasmFrameRecording;
+  debug_assert!(!fi.is_show_existing_frame());
+  let obu_extension = 0;
+
+  let mut packet = Vec::new();
+
+  if fi.enable_segmentation {
+    fs.segmentation = get_initial_segmentation(fi);
+    segmentation_optimize(fi, fs);
+  }
+  let (tile_group, tile_recordings) =
+    encode_tile_group_with_phasm_tee(fi, fs, inter_cfg);
+
+  if fi.frame_type == FrameType::KEY {
+    write_key_frame_obus(&mut packet, fi, obu_extension).unwrap();
+  }
+
+  for t35 in fi.t35_metadata.iter() {
+    let mut t35_buf = Vec::new();
+    let mut t35_bw = BitWriter::endian(&mut t35_buf, BigEndian);
+    t35_bw.write_t35_metadata_obu(t35).unwrap();
+    packet.write_all(&t35_buf).unwrap();
+    t35_buf.clear();
+  }
+
+  let mut buf1 = Vec::new();
+  let mut buf2 = Vec::new();
+  {
+    let mut bw2 = BitWriter::endian(&mut buf2, BigEndian);
+    bw2.write_frame_header_obu(fi, fs, inter_cfg).unwrap();
+  }
+
+  {
+    let mut bw1 = BitWriter::endian(&mut buf1, BigEndian);
+    bw1.write_obu_header(ObuType::OBU_FRAME, obu_extension).unwrap();
+  }
+  packet.write_all(&buf1).unwrap();
+  buf1.clear();
+
+  {
+    let mut bw1 = BitWriter::endian(&mut buf1, BigEndian);
+    bw1.write_uleb128((buf2.len() + tile_group.len()) as u64).unwrap();
+  }
+  packet.write_all(&buf1).unwrap();
+  buf1.clear();
+
+  packet.write_all(&buf2).unwrap();
+  buf2.clear();
+
+  // Capture tile_group offset BEFORE writing the tile bytes.
+  let tile_group_offset = packet.len();
+  let tile_group_len = tile_group.len();
+  packet.write_all(&tile_group).unwrap();
+
+  let recording = PhasmFrameRecording {
+    tiles: tile_recordings,
+    tile_group_offset,
+    tile_group_len,
+  };
+  (packet, recording)
+}
+
 pub fn encode_frame<T: Pixel>(
   fi: &FrameInvariants<T>, fs: &mut FrameState<T>, inter_cfg: &InterConfig,
 ) -> Vec<u8> {
@@ -3943,6 +4132,50 @@ mod phasm_smoke_tests {
     (fi, fs, blocks, inter_cfg)
   }
 
+  /// Same as setup_frame_state but 128x128 — avoids the kmeans
+  /// underflow rav1e hits on the 64x64 frame during post-encode
+  /// palette analysis. Used by tests that exercise the full
+  /// encode_frame pipeline (post-encode filters).
+  fn setup_frame_state_128() -> (
+    FrameInvariants<u8>,
+    FrameState<u8>,
+    FrameBlocks,
+    InterConfig,
+  ) {
+    let config = Arc::new(EncoderConfig {
+      width: 128,
+      height: 128,
+      bit_depth: 8,
+      chroma_sampling: ChromaSampling::Cs420,
+      quantizer: 30,
+      ..Default::default()
+    });
+    let mut sequence = Sequence::new(&config);
+    sequence.enable_large_lru = false;
+    let mut fi = FrameInvariants::<u8>::new_key_frame(
+      config.clone(),
+      Arc::new(sequence),
+      0,
+      Box::new([]),
+    );
+    // Disable segmentation — its kmeans on spatiotemporal_scores
+    // underflows when lookahead hasn't populated the scores (which
+    // happens when we bypass Context API and construct fi/fs
+    // manually). For the v0.3 single-frame test, segmentation is
+    // optional — disable it to avoid the underflow.
+    fi.enable_segmentation = false;
+    let mut input_frame = Frame::new(
+      fi.width,
+      fi.height,
+      fi.sequence.chroma_sampling,
+    );
+    fill_gradient(&mut input_frame);
+    let fs = FrameState::new_with_frame(&fi, Arc::new(input_frame));
+    let blocks = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let inter_cfg = InterConfig::new(&config);
+    (fi, fs, blocks, inter_cfg)
+  }
+
   /// Fill the frame with a deterministic non-uniform pattern so the
   /// encoder actually produces non-zero AC coefficients (and thus
   /// AC sign bits + golomb tails — the L(1) emission sites we want
@@ -4070,6 +4303,86 @@ mod phasm_smoke_tests {
         t
       );
     }
+  }
+
+  /// W3.10.4 smoke test: `encode_frame_with_phasm_tee` produces
+  /// OBU-wrapped bytes + per-tile recorder data + tile_group offset
+  /// in a single call. Validates the end-to-end production stego
+  /// encode path primitive that phasm-core's av1_stego_encode flow
+  /// builds on.
+  ///
+  /// Critical invariants:
+  ///   - packet bytes are non-empty + start with valid OBU framing
+  ///   - tiles vec is non-empty (≥1 tile per frame)
+  ///   - tile_group_offset points at a real position in the packet
+  ///     (packet[offset..] is the tile_group raw bytes)
+  ///   - each tile's recorder has captured AcCoeffSign tags
+  #[test]
+  fn encode_frame_with_phasm_tee_produces_packet_and_recording() {
+    use crate::ec::PHASM_TAG_AC_COEFF_SIGN;
+
+    // 64x64 setup_frame_state triggers a rav1e kmeans underflow
+    // (palette analysis on synthetic gradient hits an empty-data
+    // case at util/kmeans.rs:22). Use 128x128 setup for this test —
+    // rav1e's full pipeline (post-encode deblock + CDEF + LR) is
+    // happier with a slightly larger frame.
+    let (fi, mut fs, _blocks, inter_cfg) = setup_frame_state_128();
+
+    let (packet, recording) = encode_frame_with_phasm_tee(&fi, &mut fs, &inter_cfg);
+
+    // Packet must be non-empty + OBU-wrapped.
+    assert!(!packet.is_empty(), "encode_frame_with_phasm_tee must produce non-empty packet");
+
+    // tile_group_offset must be inside the packet.
+    assert!(
+      recording.tile_group_offset < packet.len(),
+      "tile_group_offset {} >= packet.len() {}",
+      recording.tile_group_offset,
+      packet.len()
+    );
+
+    // tile_group_len + tile_group_offset must equal packet.len.
+    assert_eq!(
+      recording.tile_group_offset + recording.tile_group_len,
+      packet.len(),
+      "tile_group offset+len mismatch: offset={}, len={}, packet={}",
+      recording.tile_group_offset,
+      recording.tile_group_len,
+      packet.len()
+    );
+
+    // At least one tile recording.
+    assert_eq!(
+      recording.tiles.len(),
+      1,
+      "v0.3 single-tile config should produce exactly 1 tile recording"
+    );
+
+    // Tile recording has data.
+    let tile_rec = &recording.tiles[0];
+    assert!(!tile_rec.storage.is_empty(), "tile storage must be non-empty");
+    assert_eq!(
+      tile_rec.bit_positions.len(),
+      tile_rec.bit_tags.len(),
+      "tile bit_positions / bit_tags must be parallel"
+    );
+    assert!(
+      !tile_rec.bit_positions.is_empty(),
+      "tile must have captured ≥1 L(1) emission"
+    );
+
+    // AcCoeffSign tags captured.
+    let ac_count = tile_rec
+      .bit_tags
+      .iter()
+      .filter(|&&t| t == PHASM_TAG_AC_COEFF_SIGN)
+      .count();
+    assert!(
+      ac_count > 0,
+      "tile must capture ≥1 AcCoeffSign tag; got {} of {} total",
+      ac_count,
+      tile_rec.bit_tags.len()
+    );
   }
 
   /// W3.10.3 smoke test: `encode_tile::<WriterTee>` produces BOTH

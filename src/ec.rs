@@ -155,6 +155,46 @@ pub const PHASM_TAG_OTHER: u8 = 0;
 pub const PHASM_TAG_AC_COEFF_SIGN: u8 = 1;
 pub const PHASM_TAG_GOLOMB_TAIL_LSB: u8 = 2;
 
+/// phasm-stego (W3.10.4): per-tile recorder snapshot extracted from
+/// a `WriterTee` after `encode_tile` finishes. Returned to phasm-core
+/// from `encode_tile_group_with_phasm_tee` (one entry per tile in the
+/// frame) so the STC plan can iterate cover positions across all
+/// tiles + replay_with_overrides has the storage tuples to walk.
+#[derive(Debug, Clone)]
+pub struct PhasmTileRecording {
+  /// `(fl, fh, nms)` tuples emitted during encode — feed to
+  /// `replay_with_overrides`.
+  pub storage: Vec<(u16, u16, u16)>,
+  /// `(storage_index, natural_bit_value)` for every 50/50 emission —
+  /// the cover position registry.
+  pub bit_positions: Vec<(u32, u16)>,
+  /// Per-emission channel tag (`PHASM_TAG_*`), parallel to
+  /// `bit_positions`.
+  pub bit_tags: Vec<u8>,
+}
+
+/// phasm-stego (W3.10.4): full-frame recording metadata returned from
+/// `encode_frame_with_phasm_tee` + `Context::receive_packet_with_phasm_recording`.
+/// Carries per-tile recorder data AND the byte offset where the
+/// tile_group bytes start within the OBU-wrapped packet — needed by
+/// phasm-core to splice stego tile bytes into the natural packet.
+#[derive(Debug, Clone)]
+pub struct PhasmFrameRecording {
+  /// Per-tile recorder snapshot, in tile-emission order (matches
+  /// `build_raw_tile_group` order).
+  pub tiles: Vec<PhasmTileRecording>,
+  /// Byte offset within the packet where the tile_group bytes start.
+  /// `packet[..tile_group_offset]` is the OBU prefix (sequence header
+  /// + frame header + tile_group_obu_header + ULEB128 size); the
+  /// remainder is the raw tile bytes.
+  pub tile_group_offset: usize,
+  /// Length of the tile_group bytes (i.e., `packet.len() -
+  /// tile_group_offset`). Phasm-core uses this for length-invariance
+  /// checks on the splice (Tier 1 50/50 flips don't change tile_group
+  /// length per W3.8.6).
+  pub tile_group_len: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterBase<S> {
   /// The number of values in the current range.

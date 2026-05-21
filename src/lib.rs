@@ -64,14 +64,21 @@ pub mod phasm_stego {
   pub use crate::context::FrameBlocks;
   pub use crate::ec::{
     PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_GOLOMB_TAIL_LSB, PHASM_TAG_OTHER,
-    // W3.10.3: WriterTee combined Encoder+Recorder backend. Used by
-    // phasm-core's av1_stego_encode orchestrator to run a single
-    // Pass 1 encode that produces both natural bytes AND recorder
-    // data without rev1e's lookahead-derived state drifting between
-    // two separate encode calls.
+    // W3.10.3: WriterTee combined Encoder+Recorder backend.
     WriterTee,
+    // W3.10.4: recorder data types returned from
+    // encode_frame_with_phasm_tee.
+    PhasmFrameRecording, PhasmTileRecording,
   };
-  pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
+  pub use crate::encoder::{
+    encode_tile, FrameInvariants, FrameState,
+    // W3.10.4: frame-level encode that returns OBU-wrapped bytes
+    // + per-tile recorder data + tile_group offset from one call.
+    // Enables phasm-core's av1_stego_encode flow without needing
+    // the Context API plumbing (which would require generalizing
+    // encode_normal_packet over the writer backend).
+    encode_frame_with_phasm_tee,
+  };
   pub use crate::stats::EncoderStats;
 
   // Helpers wrapping pub(crate) constructors so external callers
