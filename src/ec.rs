@@ -827,6 +827,19 @@ impl WriterBase<WriterRecorder> {
     // routed via the SBSQueueEntry CDEF queue (encoder.rs:3497).
     // For non-Recorder destinations (Counter / Encoder), the
     // phasm_track_bit + phasm_set_tag calls are default no-ops.
+    //
+    // phasm-stego (W3.10.4-fix): RESET dest's tag to OTHER at end
+    // of replay. Otherwise the dest's current_tag stays at whatever
+    // the LAST replayed bit's tag was (typically AC_COEFF_SIGN or
+    // GOLOMB_TAIL_LSB), and subsequent direct writes to dest
+    // (like write_cdef + write_lrf between two replay calls in
+    // check_lf_queue) inherit that leftover tag → outer recorder
+    // mis-tags those bits.
+    //
+    // Diagnosed 2026-05-21 via W3.10.4 strict-parity test:
+    // 2655 (enc=GOLOMB, dec=OTHER) + 56 (enc=AC, dec=OTHER) tag
+    // mismatches were ALL from this leftover-tag leak on the
+    // encoder side over-tagging non-coefficient bits.
     let mut bit_iter = self
       .s
       .phasm_bit_positions
@@ -843,6 +856,10 @@ impl WriterBase<WriterRecorder> {
       }
       dest.store(fl, fh, nms);
     }
+    // CRITICAL: reset dest's tag to OTHER so subsequent direct
+    // writes (write_cdef, write_lrf, etc.) don't inherit the
+    // last replayed bit's tag.
+    dest.phasm_set_tag(PHASM_TAG_OTHER);
     self.rng = 0x8000;
     self.cnt = -9;
     self.s.storage.truncate(0);
