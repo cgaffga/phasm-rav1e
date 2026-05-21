@@ -110,6 +110,14 @@ pub trait StorageBackend {
   fn checkpoint(&mut self) -> WriterCheckpoint;
   /// Backend implementation of rollback to pass through Writer interface
   fn rollback(&mut self, _: &WriterCheckpoint);
+  /// phasm-stego (fork): record a 50/50 binary emission for hybrid
+  /// Pass 2 replay-with-overrides on the phasm-core side. Called from
+  /// `Writer::bool` when `f == 16384` (i.e. the L(1) probability),
+  /// BEFORE the corresponding `store()` call that pushes the (fl, fh,
+  /// nms) tuple. Default no-op for backends that don't need replay-
+  /// with-overrides support (Counter / Encoder).
+  #[inline]
+  fn phasm_track_bit(&mut self, _value: u16) {}
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +148,15 @@ pub struct WriterRecorder {
   storage: Vec<(u16, u16, u16)>,
   /// Bits that would be shifted out to date
   bits: usize,
+  /// phasm-stego (fork): parallel index of 50/50 binary emissions.
+  /// Each entry is `(storage_index, natural_bit_value)` recorded by
+  /// `phasm_track_bit` BEFORE the corresponding `store()` call (so
+  /// `storage_index` is the position of the matching (fl, fh, nms)
+  /// tuple in `storage`). Sorted ascending by storage_index (monotonic
+  /// insert). Truncated by `rollback()` and cleared by `replay()`.
+  /// Memory: ~6 bytes/entry; ~200k L(1) emissions/frame at 1080p →
+  /// ~1.6 MB/frame, ~48 MB/30-frame GOP. Acceptable for mobile.
+  phasm_bit_positions: Vec<(u32, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +193,11 @@ impl WriterCounter {
 impl WriterRecorder {
   #[inline]
   pub const fn new() -> WriterBase<WriterRecorder> {
-    WriterBase::new(WriterRecorder { storage: Vec::new(), bits: 0 })
+    WriterBase::new(WriterRecorder {
+      storage: Vec::new(),
+      bits: 0,
+      phasm_bit_positions: Vec::new(),
+    })
   }
 }
 
@@ -254,6 +275,24 @@ impl StorageBackend for WriterBase<WriterRecorder> {
     self.cnt = checkpoint.cnt;
     self.s.bits = checkpoint.stream_size;
     self.s.storage.truncate(checkpoint.backend_var);
+    // phasm-stego (fork): phasm_bit_positions is sorted ascending by
+    // storage_index (monotonic insert). Truncate entries pointing into
+    // the rolled-back region via partition_point binary search.
+    let cutoff = checkpoint.backend_var as u32;
+    let pt = self
+      .s
+      .phasm_bit_positions
+      .partition_point(|(idx, _)| *idx < cutoff);
+    self.s.phasm_bit_positions.truncate(pt);
+  }
+  /// phasm-stego (fork): record a 50/50 binary emission. Called from
+  /// `Writer::bool` when `f == 16384`, BEFORE the matching `store()`
+  /// call — so `storage.len()` is the index where the corresponding
+  /// (fl, fh, nms) tuple will land.
+  #[inline]
+  fn phasm_track_bit(&mut self, value: u16) {
+    let idx = self.s.storage.len() as u32;
+    self.s.phasm_bit_positions.push((idx, value));
   }
 }
 
@@ -423,6 +462,25 @@ impl WriterBase<WriterRecorder> {
     self.cnt = -9;
     self.s.storage.truncate(0);
     self.s.bits = 0;
+    // phasm-stego (fork): bit positions paired to storage; drained too.
+    self.s.phasm_bit_positions.truncate(0);
+  }
+
+  /// phasm-stego (fork): borrow recorded storage tuples without
+  /// draining the recorder. Used by phasm-core hybrid replay-with-
+  /// overrides to iterate the recorded (fl, fh, nms) stream while
+  /// applying L(1) overrides at the parallel `phasm_bit_positions`.
+  #[inline]
+  pub fn phasm_storage(&self) -> &[(u16, u16, u16)] {
+    &self.s.storage
+  }
+
+  /// phasm-stego (fork): borrow recorded 50/50 binary emission index.
+  /// Each entry is `(storage_index, natural_value)`. Sorted ascending
+  /// by `storage_index`.
+  #[inline]
+  pub fn phasm_bit_positions(&self) -> &[(u32, u16)] {
+    &self.s.phasm_bit_positions
   }
 }
 
@@ -485,6 +543,15 @@ where
   fn bool(&mut self, val: bool, f: u16) {
     debug_assert!(0 < f);
     debug_assert!(f < 32768);
+    // phasm-stego (fork): `bool(_, 16384)` is the 50/50 L(1)-equivalent
+    // emission used by `bit()`, `literal()`, `write_golomb()`,
+    // `write_subexp()`, and several direct callers (e.g. delta_lf
+    // sign in src/context/block_unit.rs). Track the natural bit value
+    // so phasm-core hybrid replay can apply Tier 1 overrides. Default
+    // StorageBackend impl is a no-op; WriterRecorder overrides it.
+    if f == 16384 {
+      self.phasm_track_bit(u16::from(val));
+    }
     self.symbol(u32::from(val), &[f, 0]);
   }
   /// Encode a single boolean value.
