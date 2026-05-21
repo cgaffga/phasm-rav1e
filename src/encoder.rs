@@ -3914,6 +3914,11 @@ mod phasm_smoke_tests {
       height: 64,
       bit_depth: 8,
       chroma_sampling: ChromaSampling::Cs420,
+      // Low QP (high quality) so AC coefficients survive
+      // quantization and the encoder emits sign bits. Default QP=100
+      // quantizes the gradient to DC-only on a 64×64 frame, leaving
+      // zero AcCoeffSign emissions — see W3.9.0 smoke test learning.
+      quantizer: 30,
       ..Default::default()
     });
     let mut sequence = Sequence::new(&config);
@@ -4000,6 +4005,70 @@ mod phasm_smoke_tests {
         "bit positions must be monotonically non-decreasing"
       );
       prev_idx = idx as i64;
+    }
+  }
+
+  /// W3.9.0 smoke test: `encode_tile::<WriterRecorder>` produces a
+  /// recorder where `phasm_bit_tags` parallels `phasm_bit_positions`
+  /// (same length) AND contains at least one `PHASM_TAG_AC_COEFF_SIGN`
+  /// entry (the encoder must emit AC sign bits on a gradient frame).
+  #[test]
+  fn encode_tile_recorder_captures_ac_coeff_sign_tags() {
+    use crate::ec::{PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_OTHER};
+
+    let (fi, mut fs, mut blocks, inter_cfg) = setup_frame_state();
+    let mut cdf = get_initial_cdfcontext(&fi);
+
+    let ti = &fi.sequence.tiling;
+    let mut iter = ti.tile_iter_mut(&mut fs, &mut blocks);
+    let mut ctx = iter.next().expect("single-tile config yields one tile");
+    drop(iter);
+
+    let (recorder, _stats): (WriterBase<WriterRecorder>, _) =
+      encode_tile(&fi, &mut ctx.ts, &mut cdf, &mut ctx.tb, &inter_cfg);
+
+    let positions = recorder.phasm_bit_positions();
+    let tags = recorder.phasm_bit_tags();
+
+    // Length parity invariant.
+    assert_eq!(
+      positions.len(),
+      tags.len(),
+      "phasm_bit_positions and phasm_bit_tags must have equal length"
+    );
+
+    // Must capture some AcCoeffSign emissions (gradient frame
+    // produces non-zero AC coefficients → sign bits emitted at
+    // the tagged site in encode_coeff_signs).
+    let ac_sign_count = tags
+      .iter()
+      .filter(|&&t| t == PHASM_TAG_AC_COEFF_SIGN)
+      .count();
+    assert!(
+      ac_sign_count > 0,
+      "encode_coeff_signs must emit at least one tagged AcCoeffSign bit on a gradient frame; got {} positions, 0 AcCoeffSign tags",
+      positions.len()
+    );
+
+    // All other 50/50 emissions should be tagged OTHER by default
+    // (delta_lf signs, write_subexp flags, generic literals from
+    // headers, etc.). The Other count should be > 0 — there are
+    // header / frame-level 50/50 emissions on every key frame.
+    let other_count = tags.iter().filter(|&&t| t == PHASM_TAG_OTHER).count();
+    assert!(
+      other_count > 0,
+      "expected some PHASM_TAG_OTHER tagged emissions (header bits, etc.)"
+    );
+
+    // Tags must all be valid known values (no garbage).
+    for &t in tags.iter() {
+      assert!(
+        t == PHASM_TAG_OTHER
+          || t == PHASM_TAG_AC_COEFF_SIGN
+          || t == crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB,
+        "unexpected tag value {} — must be one of OTHER/AcCoeffSign/GolombTailLsb",
+        t
+      );
     }
   }
 

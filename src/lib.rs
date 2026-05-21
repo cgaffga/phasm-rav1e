@@ -62,6 +62,9 @@ pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 pub mod phasm_stego {
   pub use crate::api::PhasmInterConfig as InterConfig;
   pub use crate::context::FrameBlocks;
+  pub use crate::ec::{
+    PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_GOLOMB_TAIL_LSB, PHASM_TAG_OTHER,
+  };
   pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
   pub use crate::stats::EncoderStats;
 

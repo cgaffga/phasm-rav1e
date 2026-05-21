@@ -1997,13 +1997,34 @@ impl ContextWriter<'_> {
         let cdf = &self.fc.dc_sign_cdf[plane_type][txb_ctx.dc_sign_ctx];
         symbol_with_update!(self, w, sign, cdf);
       } else {
+        // phasm-stego (W3.9.0): tag this 50/50 emission as
+        // AcCoeffSign — the v0.3-AV1 primary Tier 1 channel per
+        // phasm-av1/docs/design/video/av1/channel-design.md § 4.1.
+        // The bit() call routes through bool(_, 16384) which fires
+        // phasm_track_bit; the recorder reads the current tag.
+        // Tag is reset after the call so subsequent unrelated 50/50
+        // emissions default to PHASM_TAG_OTHER.
+        //
+        // Note: when emitted via SBSQueueEntry's CDEF-queue
+        // WriterRecorder (encoder.rs:3497), the tag travels through
+        // WriterRecorder::replay (ec.rs) which propagates
+        // phasm_set_tag + phasm_track_bit to the destination.
+        w.phasm_set_tag(crate::ec::PHASM_TAG_AC_COEFF_SIGN);
         w.bit(sign as u16);
+        w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
       }
       // save extra golomb codes for separate loop
       if level > T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS) {
+        // phasm-stego (W3.9.0): tag the golomb data bits as
+        // GolombTailLsb — the Tier 1 secondary channel per
+        // channel-design.md § 4.2. Wired but not enrolled in v0.3
+        // (channel-design.md § 6); v0.5+ enrollment uses these
+        // positions.
+        w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
         w.write_golomb(u32::cast_from(
           level - T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1),
         ));
+        w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
       }
     }
 

@@ -95,6 +95,18 @@ pub trait Writer {
   fn rollback(&mut self, _: &WriterCheckpoint);
   /// Add additional bits from rate estimators without coding a real symbol
   fn add_bits_frac(&mut self, bits_frac: u32);
+  /// phasm-stego (fork, W3.9.0): set the per-channel emission tag for
+  /// subsequent 50/50 binary emissions (`bit()` / `bool(_, 16384)` /
+  /// `literal()` / `write_golomb()`). Recorded by the
+  /// `WriterRecorder` backend's `phasm_track_bit` hook; no-op for
+  /// other backends. Default no-op so most Writer impls don't need
+  /// to provide it; `WriterBase<S>`'s impl forwards to its
+  /// `StorageBackend::phasm_set_tag`.
+  ///
+  /// Callers (e.g. `encode_coeff_signs`) typically set a tag, emit
+  /// one or more 50/50 symbols, then reset to `PHASM_TAG_OTHER`.
+  #[inline]
+  fn phasm_set_tag(&mut self, _tag: u8) {}
 }
 
 /// `StorageBackend` is an internal trait used to tie a specific `Writer`
@@ -118,7 +130,30 @@ pub trait StorageBackend {
   /// with-overrides support (Counter / Encoder).
   #[inline]
   fn phasm_track_bit(&mut self, _value: u16) {}
+
+  /// phasm-stego (fork, W3.9.0): set the per-emission-site tag that
+  /// the next `phasm_track_bit` call will record alongside the value.
+  /// Tag is "sticky" — stays set until the next `phasm_set_tag` call.
+  /// Default no-op for non-Recorder backends.
+  ///
+  /// Used by `encode_coeff_signs` (block_unit.rs) to distinguish:
+  ///   - `PHASM_TAG_AC_COEFF_SIGN` (AC coefficient sign emissions)
+  ///   - `PHASM_TAG_GOLOMB_TAIL_LSB` (golomb tail data bits)
+  ///   - `PHASM_TAG_OTHER` (default for all other 50/50 emissions)
+  ///
+  /// Per-channel classification per `phasm-av1/docs/design/video/av1/
+  /// channel-design.md` § 4. Walker filters by tag to enforce v0.3-AV1
+  /// AcCoeffSign-only ship-gate (channel-design.md § 6).
+  #[inline]
+  fn phasm_set_tag(&mut self, _tag: u8) {}
 }
+
+// phasm-stego (W3.9.0): per-channel emission tags. Values are
+// stable across phasm-rav1e + phasm-core versions (used in the
+// recorder's phasm_bit_tags Vec which crosses the FFI-ish boundary).
+pub const PHASM_TAG_OTHER: u8 = 0;
+pub const PHASM_TAG_AC_COEFF_SIGN: u8 = 1;
+pub const PHASM_TAG_GOLOMB_TAIL_LSB: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct WriterBase<S> {
@@ -157,6 +192,18 @@ pub struct WriterRecorder {
   /// Memory: ~6 bytes/entry; ~200k L(1) emissions/frame at 1080p →
   /// ~1.6 MB/frame, ~48 MB/30-frame GOP. Acceptable for mobile.
   phasm_bit_positions: Vec<(u32, u16)>,
+  /// phasm-stego (fork, W3.9.0): per-position emission tag, parallel
+  /// to `phasm_bit_positions`. `phasm_bit_tags[i]` = tag for the
+  /// emission recorded at `phasm_bit_positions[i]`. One of
+  /// `PHASM_TAG_*` constants. Default tag (when `phasm_set_tag` not
+  /// called) is `PHASM_TAG_OTHER` = 0. Memory: 1 byte/entry; ~200k
+  /// entries/frame at 1080p → ~200 KB/frame, ~6 MB/GOP.
+  phasm_bit_tags: Vec<u8>,
+  /// phasm-stego (fork, W3.9.0): sticky tag state. Set by
+  /// `phasm_set_tag`; read by `phasm_track_bit` on each invocation
+  /// and pushed to `phasm_bit_tags`. Stays at last-set value until
+  /// next `phasm_set_tag` call.
+  phasm_current_tag: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +251,8 @@ impl WriterRecorder {
       storage: Vec::new(),
       bits: 0,
       phasm_bit_positions: Vec::new(),
+      phasm_bit_tags: Vec::new(),
+      phasm_current_tag: PHASM_TAG_OTHER,
     })
   }
 }
@@ -215,6 +264,8 @@ impl Default for WriterRecorder {
       storage: Vec::new(),
       bits: 0,
       phasm_bit_positions: Vec::new(),
+      phasm_bit_tags: Vec::new(),
+      phasm_current_tag: PHASM_TAG_OTHER,
     }
   }
 }
@@ -309,15 +360,29 @@ impl StorageBackend for WriterBase<WriterRecorder> {
       .phasm_bit_positions
       .partition_point(|(idx, _)| *idx < cutoff);
     self.s.phasm_bit_positions.truncate(pt);
+    // phasm-stego (W3.9.0): phasm_bit_tags is parallel to
+    // phasm_bit_positions; truncate to the same length.
+    self.s.phasm_bit_tags.truncate(pt);
   }
   /// phasm-stego (fork): record a 50/50 binary emission. Called from
   /// `Writer::bool` when `f == 16384`, BEFORE the matching `store()`
   /// call — so `storage.len()` is the index where the corresponding
   /// (fl, fh, nms) tuple will land.
+  ///
+  /// W3.9.0: also records the current `phasm_current_tag` value into
+  /// the parallel `phasm_bit_tags` Vec.
   #[inline]
   fn phasm_track_bit(&mut self, value: u16) {
     let idx = self.s.storage.len() as u32;
     self.s.phasm_bit_positions.push((idx, value));
+    self.s.phasm_bit_tags.push(self.s.phasm_current_tag);
+  }
+  /// phasm-stego (W3.9.0): set the per-channel emission tag. Sticky
+  /// state — the next `phasm_track_bit` invocations record this tag
+  /// until reset.
+  #[inline]
+  fn phasm_set_tag(&mut self, tag: u8) {
+    self.s.phasm_current_tag = tag;
   }
 }
 
@@ -481,15 +546,36 @@ impl WriterBase<WriterRecorder> {
   /// storage and into the passed in Writer, which may be an Encoder
   /// or another Recorder.  Clears the Recorder after replay.
   pub fn replay(&mut self, dest: &mut dyn StorageBackend) {
-    for &(fl, fh, nms) in &self.s.storage {
+    // phasm-stego (W3.9.0): walk storage + phasm_bit_positions in
+    // lockstep so phasm_track_bit + phasm_set_tag calls propagate
+    // to the destination. Otherwise the OUTER WriterRecorder (e.g.
+    // encode_tile's frame-level recorder) wouldn't see AcCoeffSign
+    // / GolombTailLsb tags from per-block coefficient emissions
+    // routed via the SBSQueueEntry CDEF queue (encoder.rs:3497).
+    // For non-Recorder destinations (Counter / Encoder), the
+    // phasm_track_bit + phasm_set_tag calls are default no-ops.
+    let mut bit_iter = self
+      .s
+      .phasm_bit_positions
+      .iter()
+      .zip(self.s.phasm_bit_tags.iter())
+      .peekable();
+    for (i, &(fl, fh, nms)) in self.s.storage.iter().enumerate() {
+      if let Some(&(&(bit_idx, bit_val), &tag)) = bit_iter.peek() {
+        if bit_idx as usize == i {
+          bit_iter.next();
+          dest.phasm_set_tag(tag);
+          dest.phasm_track_bit(bit_val);
+        }
+      }
       dest.store(fl, fh, nms);
     }
     self.rng = 0x8000;
     self.cnt = -9;
     self.s.storage.truncate(0);
     self.s.bits = 0;
-    // phasm-stego (fork): bit positions paired to storage; drained too.
     self.s.phasm_bit_positions.truncate(0);
+    self.s.phasm_bit_tags.truncate(0);
   }
 
   /// phasm-stego (fork): borrow recorded storage tuples without
@@ -507,6 +593,15 @@ impl WriterBase<WriterRecorder> {
   #[inline]
   pub fn phasm_bit_positions(&self) -> &[(u32, u16)] {
     &self.s.phasm_bit_positions
+  }
+
+  /// phasm-stego (W3.9.0): borrow per-position emission tags, parallel
+  /// to `phasm_bit_positions`. `phasm_bit_tags()[i]` is the
+  /// `PHASM_TAG_*` value at the time `phasm_bit_positions()[i]` was
+  /// recorded. Length always equals `phasm_bit_positions().len()`.
+  #[inline]
+  pub fn phasm_bit_tags(&self) -> &[u8] {
+    &self.s.phasm_bit_tags
   }
 }
 
@@ -590,6 +685,13 @@ where
   // fake add bits
   fn add_bits_frac(&mut self, bits_frac: u32) {
     self.fake_bits_frac += bits_frac
+  }
+  // phasm-stego (W3.9.0): Writer trait forwarding to StorageBackend's
+  // phasm_set_tag. For WriterRecorder backend, sets the recorder's
+  // tag state; for Counter/Encoder, default no-op fires via the
+  // StorageBackend trait method.
+  fn phasm_set_tag(&mut self, tag: u8) {
+    <Self as StorageBackend>::phasm_set_tag(self, tag);
   }
   /// Encode a literal bitstring, bit by bit in MSB order, with flat
   /// probability.
