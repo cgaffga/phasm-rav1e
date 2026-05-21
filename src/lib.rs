@@ -64,6 +64,12 @@ pub mod phasm_stego {
   pub use crate::context::FrameBlocks;
   pub use crate::ec::{
     PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_GOLOMB_TAIL_LSB, PHASM_TAG_OTHER,
+    // W3.10.3: WriterTee combined Encoder+Recorder backend. Used by
+    // phasm-core's av1_stego_encode orchestrator to run a single
+    // Pass 1 encode that produces both natural bytes AND recorder
+    // data without rev1e's lookahead-derived state drifting between
+    // two separate encode calls.
+    WriterTee,
   };
   pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
   pub use crate::stats::EncoderStats;

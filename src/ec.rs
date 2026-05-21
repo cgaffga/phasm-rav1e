@@ -285,6 +285,76 @@ impl Default for WriterEncoder {
   }
 }
 
+/// phasm-stego (W3.10.3): combined Encoder + Recorder backend. Used
+/// by phasm-core to run a single Pass 1 encode that simultaneously
+/// produces:
+///   - encoded bytes (via the Encoder-side precarry / low / done())
+///   - position recording (via the Recorder-side storage +
+///     phasm_bit_positions + phasm_bit_tags)
+///
+/// Mirror of `WriterRecorder` fields + `WriterEncoder` fields fused.
+/// All `store()` calls update both sides atomically using the same
+/// `(fl, fh, nms)` tuple → single (rng, cnt, d) computation drives
+/// both the byte emission AND the storage push.
+///
+/// Used by phasm-core's `av1_stego_encode` orchestration so a single
+/// Context API call produces both natural bytes AND the recorder
+/// data needed for STC plan computation. Without WriterTee, we'd
+/// need two encode passes (one for bytes, one for recording) and
+/// they could diverge if rav1e's internal lookahead-derived state
+/// shifts between calls.
+#[derive(Debug, Clone)]
+pub struct WriterTee {
+  // === Encoder side ===
+  precarry: Vec<u16>,
+  low: ec_window,
+  // === Recorder side ===
+  storage: Vec<(u16, u16, u16)>,
+  bits: usize,
+  phasm_bit_positions: Vec<(u32, u16)>,
+  phasm_bit_tags: Vec<u8>,
+  phasm_current_tag: u8,
+  // === Checkpoint side-state ===
+  /// LIFO stack of rollback snapshots. RDO uses nested
+  /// checkpoint/rollback cycles; checkpoint pushes a snapshot,
+  /// rollback pops back to it. Cleared at frame boundary by the
+  /// caller (or implicitly when the writer is dropped).
+  pending_checkpoints: Vec<TeeRollbackState>,
+}
+
+#[derive(Debug, Clone)]
+struct TeeRollbackState {
+  low: ec_window,
+  precarry_len: usize,
+  storage_len: usize,
+  bits: usize,
+  phasm_bit_positions_len: usize,
+  phasm_current_tag: u8,
+}
+
+impl WriterTee {
+  #[inline]
+  pub fn new() -> WriterBase<WriterTee> {
+    WriterBase::new(WriterTee::default())
+  }
+}
+
+impl Default for WriterTee {
+  #[inline]
+  fn default() -> Self {
+    WriterTee {
+      precarry: Vec::new(),
+      low: 0,
+      storage: Vec::new(),
+      bits: 0,
+      phasm_bit_positions: Vec::new(),
+      phasm_bit_tags: Vec::new(),
+      phasm_current_tag: PHASM_TAG_OTHER,
+      pending_checkpoints: Vec::new(),
+    }
+  }
+}
+
 /// The Counter stores nothing we write to it, it merely counts the
 /// bit usage like in an Encoder for cost analysis.
 impl StorageBackend for WriterBase<WriterCounter> {
@@ -433,6 +503,169 @@ impl StorageBackend for WriterBase<WriterEncoder> {
     self.cnt = checkpoint.cnt;
     self.s.low = checkpoint.backend_var as ec_window;
     self.s.precarry.truncate(checkpoint.stream_size);
+  }
+}
+
+/// phasm-stego (W3.10.3): combined Encoder + Recorder StorageBackend.
+/// Every `store()` call drives both sides atomically — one
+/// `lr_compute` produces the shared (l, r, d), then both the encoder
+/// (precarry / low / cnt) and recorder (storage / bits) state get
+/// updated. phasm_track_bit + phasm_set_tag mirror the Recorder
+/// impl; rollback uses a LIFO stack of TeeRollbackState snapshots
+/// indexed by backend_var (RDO checkpoint/rollback compatible).
+impl StorageBackend for WriterBase<WriterTee> {
+  fn store(&mut self, fl: u16, fh: u16, nms: u16) {
+    let (l, r) = self.lr_compute(fl, fh, nms);
+    let mut low = l + self.s.low;
+    let mut c = self.cnt;
+    let d = r.leading_zeros() as usize;
+    let mut s = c + (d as i16);
+
+    // Encoder side: precarry push + low / cnt update (copy of
+    // WriterEncoder::store at ec.rs:265).
+    if s >= 0 {
+      c += 16;
+      let mut m = (1 << c) - 1;
+      if s >= 8 {
+        self.s.precarry.push((low >> c) as u16);
+        low &= m;
+        c -= 8;
+        m >>= 8;
+      }
+      self.s.precarry.push((low >> c) as u16);
+      s = c + (d as i16) - 24;
+      low &= m;
+    }
+    self.s.low = low << d;
+    self.rng = r << d;
+    self.cnt = s;
+
+    // Recorder side: storage push + bits counter.
+    self.s.bits += d;
+    self.s.storage.push((fl, fh, nms));
+  }
+  #[inline]
+  fn stream_bits(&mut self) -> usize {
+    // Use recorder-side bit counter (more accurate than precarry * 8
+    // since it tracks partial bits).
+    self.s.bits
+  }
+  #[inline]
+  fn checkpoint(&mut self) -> WriterCheckpoint {
+    // Push a snapshot onto pending_checkpoints; encode the index in
+    // backend_var. RDO's nested checkpoint/rollback is LIFO — when
+    // rollback runs, it pops this snapshot AND any later ones.
+    let idx = self.s.pending_checkpoints.len();
+    self.s.pending_checkpoints.push(TeeRollbackState {
+      low: self.s.low,
+      precarry_len: self.s.precarry.len(),
+      storage_len: self.s.storage.len(),
+      bits: self.s.bits,
+      phasm_bit_positions_len: self.s.phasm_bit_positions.len(),
+      phasm_current_tag: self.s.phasm_current_tag,
+    });
+    WriterCheckpoint {
+      stream_size: 0, // unused for Tee
+      backend_var: idx,
+      rng: self.rng,
+      cnt: self.cnt,
+    }
+  }
+  fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    let idx = checkpoint.backend_var;
+    debug_assert!(
+      idx < self.s.pending_checkpoints.len(),
+      "WriterTee rollback to stale checkpoint idx {} (have {})",
+      idx,
+      self.s.pending_checkpoints.len()
+    );
+    let snap = self.s.pending_checkpoints[idx].clone();
+    self.rng = checkpoint.rng;
+    self.cnt = checkpoint.cnt;
+    self.s.low = snap.low;
+    self.s.precarry.truncate(snap.precarry_len);
+    self.s.storage.truncate(snap.storage_len);
+    self.s.bits = snap.bits;
+    self.s.phasm_bit_positions.truncate(snap.phasm_bit_positions_len);
+    self.s.phasm_bit_tags.truncate(snap.phasm_bit_positions_len);
+    self.s.phasm_current_tag = snap.phasm_current_tag;
+    // Pop this checkpoint AND any later ones (LIFO).
+    self.s.pending_checkpoints.truncate(idx);
+  }
+  #[inline]
+  fn phasm_track_bit(&mut self, value: u16) {
+    let idx = self.s.storage.len() as u32;
+    self.s.phasm_bit_positions.push((idx, value));
+    self.s.phasm_bit_tags.push(self.s.phasm_current_tag);
+  }
+  #[inline]
+  fn phasm_set_tag(&mut self, tag: u8) {
+    self.s.phasm_current_tag = tag;
+  }
+}
+
+/// phasm-stego (W3.10.3): WriterTee-specific accessors. done()
+/// finalizes the encoder side (mirror of WriterBase<WriterEncoder>::done)
+/// while phasm_storage / phasm_bit_positions / phasm_bit_tags expose
+/// the recorder side for STC plan computation.
+impl WriterBase<WriterTee> {
+  /// Finalize the encoder side. Same logic as
+  /// `WriterBase<WriterEncoder>::done()`.
+  pub fn done(&mut self) -> Vec<u8> {
+    let l = self.s.low;
+    let mut c = self.cnt;
+    let mut s = 10;
+    let m = 0x3FFF;
+    let mut e = ((l + m) & !m) | (m + 1);
+
+    s += c;
+
+    if s > 0 {
+      let mut n = (1 << (c + 16)) - 1;
+
+      loop {
+        self.s.precarry.push((e >> (c + 16)) as u16);
+        e &= n;
+        s -= 8;
+        c -= 8;
+        n >>= 8;
+
+        if s <= 0 {
+          break;
+        }
+      }
+    }
+
+    let mut c = 0;
+    let mut offs = self.s.precarry.len();
+    let mut out = vec![0_u8; offs];
+    while offs > 0 {
+      offs -= 1;
+      c += self.s.precarry[offs];
+      out[offs] = c as u8;
+      c >>= 8;
+    }
+
+    out
+  }
+
+  /// Borrow recorder-side storage tuples (parallel to bit_positions /
+  /// bit_tags). For use by phasm-core's STC plan + replay machinery.
+  #[inline]
+  pub fn phasm_storage(&self) -> &[(u16, u16, u16)] {
+    &self.s.storage
+  }
+
+  /// Borrow recorder-side 50/50 binary emission index.
+  #[inline]
+  pub fn phasm_bit_positions(&self) -> &[(u32, u16)] {
+    &self.s.phasm_bit_positions
+  }
+
+  /// Borrow recorder-side per-emission tags.
+  #[inline]
+  pub fn phasm_bit_tags(&self) -> &[u8] {
+    &self.s.phasm_bit_tags
   }
 }
 

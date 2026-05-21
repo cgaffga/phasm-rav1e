@@ -4072,6 +4072,92 @@ mod phasm_smoke_tests {
     }
   }
 
+  /// W3.10.3 smoke test: `encode_tile::<WriterTee>` produces BOTH
+  /// the same byte stream as a WriterEncoder run AND a populated
+  /// recorder side with non-zero AcCoeffSign tags. This is the
+  /// single-encode-with-both-sides-recording primitive that
+  /// av1_stego_encode (W3.10.4) needs.
+  ///
+  /// Critical invariant: WriterTee's done() bytes must be byte-
+  /// identical to WriterEncoder's done() bytes on the same input.
+  /// Without this, the production stego encode flow would diverge
+  /// between recording and bytes.
+  #[test]
+  fn encode_tile_with_writer_tee_byte_identical_to_encoder() {
+    use crate::ec::{
+      PHASM_TAG_AC_COEFF_SIGN, WriterBase, WriterEncoder, WriterTee,
+    };
+
+    // First pass: WriterEncoder (natural bytes only).
+    let (fi_e, mut fs_e, mut blocks_e, inter_cfg_e) = setup_frame_state();
+    let mut cdf_e = get_initial_cdfcontext(&fi_e);
+    let ti_e = &fi_e.sequence.tiling;
+    let mut iter_e = ti_e.tile_iter_mut(&mut fs_e, &mut blocks_e);
+    let mut ctx_e = iter_e.next().expect("single-tile expected");
+    drop(iter_e);
+    let (mut writer_e, _stats_e): (WriterBase<WriterEncoder>, _) =
+      encode_tile(&fi_e, &mut ctx_e.ts, &mut cdf_e, &mut ctx_e.tb, &inter_cfg_e);
+    let bytes_encoder = writer_e.done();
+
+    // Second pass: WriterTee on a fresh frame state (must construct
+    // identical fi/fs from scratch since encode_tile mutates them).
+    let (fi_t, mut fs_t, mut blocks_t, inter_cfg_t) = setup_frame_state();
+    let mut cdf_t = get_initial_cdfcontext(&fi_t);
+    let ti_t = &fi_t.sequence.tiling;
+    let mut iter_t = ti_t.tile_iter_mut(&mut fs_t, &mut blocks_t);
+    let mut ctx_t = iter_t.next().expect("single-tile expected");
+    drop(iter_t);
+    let (mut writer_t, _stats_t): (WriterBase<WriterTee>, _) =
+      encode_tile(&fi_t, &mut ctx_t.ts, &mut cdf_t, &mut ctx_t.tb, &inter_cfg_t);
+
+    // Check recorder side BEFORE done() drains.
+    let storage_len = writer_t.phasm_storage().len();
+    let bit_positions = writer_t.phasm_bit_positions().to_vec();
+    let bit_tags = writer_t.phasm_bit_tags().to_vec();
+
+    let bytes_tee = writer_t.done();
+
+    // === Invariant 1: byte identity ===
+    assert_eq!(
+      bytes_encoder.len(),
+      bytes_tee.len(),
+      "WriterTee done() byte count must match WriterEncoder: \
+       encoder={}, tee={}",
+      bytes_encoder.len(),
+      bytes_tee.len()
+    );
+    assert_eq!(
+      bytes_encoder, bytes_tee,
+      "WriterTee done() bytes must be byte-identical to WriterEncoder; \
+       any divergence would break the av1_stego_encode flow"
+    );
+
+    // === Invariant 2: recorder side populated ===
+    assert!(
+      storage_len > 0,
+      "WriterTee must have non-empty storage after encode_tile"
+    );
+    assert_eq!(
+      bit_positions.len(),
+      bit_tags.len(),
+      "WriterTee phasm_bit_positions / phasm_bit_tags must be parallel"
+    );
+    assert!(
+      !bit_positions.is_empty(),
+      "WriterTee must have captured at least one L(1) emission"
+    );
+
+    // === Invariant 3: AcCoeffSign tags captured ===
+    let ac_count = bit_tags
+      .iter()
+      .filter(|&&t| t == PHASM_TAG_AC_COEFF_SIGN)
+      .count();
+    assert!(
+      ac_count > 0,
+      "WriterTee must capture at least one AcCoeffSign tag (encode_coeff_signs sites)"
+    );
+  }
+
   /// W3.8.5 smoke test: `encode_tile::<WriterEncoder>` produces
   /// the same byte stream regardless of whether called via the
   /// generic specialisation path or via the original (now-generic)
