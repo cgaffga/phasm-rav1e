@@ -3944,6 +3944,14 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
     let mut bw2 = BitWriter::endian(&mut buf2, BigEndian);
     bw2.write_frame_header_obu(fi, fs, inter_cfg).unwrap();
   }
+  let frame_header_len = buf2.len();
+
+  // v0.4: capture the frame_obu_start offset (where the OBU header
+  // byte is) so phasm-core can rebuild the frame_obu with a
+  // recomputed ULEB128 size field when the stego tile_group has a
+  // 1-byte length delta from the natural one (rare range-coder
+  // trailing-carry edge case).
+  let frame_obu_start = packet.len();
 
   {
     let mut bw1 = BitWriter::endian(&mut buf1, BigEndian);
@@ -3954,7 +3962,7 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
 
   {
     let mut bw1 = BitWriter::endian(&mut buf1, BigEndian);
-    bw1.write_uleb128((buf2.len() + tile_group.len()) as u64).unwrap();
+    bw1.write_uleb128((frame_header_len + tile_group.len()) as u64).unwrap();
   }
   packet.write_all(&buf1).unwrap();
   buf1.clear();
@@ -3971,6 +3979,8 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
     tiles: tile_recordings,
     tile_group_offset,
     tile_group_len,
+    frame_header_len,
+    frame_obu_start,
   };
   (packet, recording)
 }

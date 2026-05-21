@@ -193,6 +193,22 @@ pub struct PhasmFrameRecording {
   /// checks on the splice (Tier 1 50/50 flips don't change tile_group
   /// length per W3.8.6).
   pub tile_group_len: usize,
+  /// Length of the frame_header_obu payload bytes (the `frame_header`
+  /// section between the OBU size field and the tile_group bytes).
+  /// v0.4 addition: needed so phasm-core can rebuild the frame_obu
+  /// with a corrected ULEB128 size field when the stego tile_group
+  /// has a 1-byte length delta from the natural one (rare range-coder
+  /// trailing-carry edge case). Without this, the byte-splice fails
+  /// with TileGroupSizeMismatch.
+  pub frame_header_len: usize,
+  /// Byte offset within the packet where the frame_obu starts (i.e.,
+  /// the position of the OBU header byte). Layout:
+  ///   `[frame_obu_start]: obu_header byte`
+  ///   `[frame_obu_start + 1 .. frame_obu_start + 1 + uleb128_len]: ULEB128 size`
+  ///   `[frame_obu_start + 1 + uleb128_len .. tile_group_offset]: frame_header`
+  ///   `[tile_group_offset .. tile_group_offset + tile_group_len]: tile_group`
+  /// v0.4 addition: paired with `frame_header_len` for OBU rebuild.
+  pub frame_obu_start: usize,
 }
 
 #[derive(Debug, Clone)]
