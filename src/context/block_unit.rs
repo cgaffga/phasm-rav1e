@@ -2050,9 +2050,18 @@ impl ContextWriter<'_> {
       if level > T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS) {
         // phasm-stego (W3.9.0): tag the golomb data bits as
         // GolombTailLsb — the Tier 1 secondary channel per
-        // channel-design.md § 4.2. Wired but not enrolled in v0.3
-        // (channel-design.md § 6); v0.5+ enrollment uses these
-        // positions.
+        // channel-design.md § 4.2. v0.5.B enrolled (phasm-av1 B.2.3).
+        //
+        // Phase B.2.2 (2026-05-21): set meta INDEPENDENT of the
+        // AC-sign branch above. The AC branch sets meta only for
+        // c >= 1 (DC at c == 0 uses CDF-coded dc_sign, not w.bit,
+        // so it doesn't run the set_meta line). Without this
+        // explicit set, DC golomb emissions would inherit stale
+        // meta from a PREVIOUS block, breaking cost compute on
+        // the joint Tier 1 cover vector.
+        let mut golomb_meta = block_meta_base;
+        golomb_meta.scan_pos = scan[c];
+        w.phasm_set_meta(golomb_meta);
         w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
         w.write_golomb(u32::cast_from(
           level - T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1),
