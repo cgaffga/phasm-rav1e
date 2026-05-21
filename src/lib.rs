@@ -63,6 +63,33 @@ pub mod phasm_stego {
   pub use crate::api::PhasmInterConfig as InterConfig;
   pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
   pub use crate::stats::EncoderStats;
+
+  // Helpers wrapping pub(crate) constructors so external callers
+  // (phasm-core) don't need crate-internal access. Mirror what the
+  // smoke test path inside src/encoder.rs::phasm_smoke_tests does.
+
+  /// Construct an `InterConfig` from an `EncoderConfig`. Wraps the
+  /// crate-private `InterConfig::new(&EncoderConfig)`.
+  pub fn make_inter_config(
+    enc_config: &crate::api::EncoderConfig,
+  ) -> InterConfig {
+    crate::api::PhasmInterConfig::new(enc_config)
+  }
+
+  /// Construct a default-padded `Frame<T>` for the given dimensions /
+  /// chroma sampling. Wraps the crate-private `FrameAlloc::new` so
+  /// callers don't need to compute LUMA_PADDING manually.
+  pub fn make_frame<T: crate::util::Pixel>(
+    width: usize,
+    height: usize,
+    chroma_sampling: crate::color::ChromaSampling,
+  ) -> crate::frame::Frame<T> {
+    <crate::frame::Frame<T> as crate::frame::FrameAlloc>::new(
+      width,
+      height,
+      chroma_sampling,
+    )
+  }
 }
 
 pub(crate) mod built_info {
