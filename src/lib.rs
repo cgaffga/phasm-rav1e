@@ -69,6 +69,8 @@ pub mod phasm_stego {
     // W3.10.4: recorder data types returned from
     // encode_frame_with_phasm_tee.
     PhasmFrameRecording, PhasmTileRecording,
+    // Phase B.1.1.a: per-AC-sign spatial metadata.
+    AcSignMeta,
   };
   pub use crate::encoder::{
     encode_tile, FrameInvariants, FrameState,
