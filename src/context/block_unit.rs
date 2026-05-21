@@ -2048,24 +2048,40 @@ impl ContextWriter<'_> {
       }
       // save extra golomb codes for separate loop
       if level > T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS) {
-        // phasm-stego (W3.9.0): tag the golomb data bits as
-        // GolombTailLsb — the Tier 1 secondary channel per
-        // channel-design.md § 4.2. v0.5.B enrolled (phasm-av1 B.2.3).
+        // phasm-stego (W3.9.0 → B.2.3.proper): tag ONLY the literal
+        // LSB of the golomb code as GolombTailLsb — the actual
+        // value-perturbing bit that flips |level| by ±1 cleanly
+        // (channel-design.md § 4.2 "LSB of golomb_data_bit").
         //
-        // Phase B.2.2 (2026-05-21): set meta INDEPENDENT of the
-        // AC-sign branch above. The AC branch sets meta only for
-        // c >= 1 (DC at c == 0 uses CDF-coded dc_sign, not w.bit,
-        // so it doesn't run the set_meta line). Without this
-        // explicit set, DC golomb emissions would inherit stale
-        // meta from a PREVIOUS block, breaking cost compute on
-        // the joint Tier 1 cover vector.
+        // Leading zeros and non-LSB literal bits are tagged OTHER:
+        // flipping them changes the code length and/or perturbs
+        // |level| by ±2/±4/..., which cascades through culLevel +
+        // downstream CDF contexts → bitstream desync.
+        //
+        // We inline write_golomb (ec.rs:1297) here so the tag dance
+        // is co-located with the bit emit order:
+        let value = u32::cast_from(
+          level - T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1),
+        );
+        let x = value + 1;
+        let length = 32 - x.leading_zeros();
+
+        // Leading zeros (length - 1 of them) — NOT enrolled.
+        w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
+        for _ in 0..length - 1 {
+          w.bit(0);
+        }
+        // Non-LSB literal bits (length - 1 of them, MSB-first) —
+        // NOT enrolled.
+        for i in (1..length).rev() {
+          w.bit(((x >> i) & 0x01) as u16);
+        }
+        // LSB literal bit — THE enrolled position.
         let mut golomb_meta = block_meta_base;
         golomb_meta.scan_pos = scan[c];
         w.phasm_set_meta(golomb_meta);
         w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
-        w.write_golomb(u32::cast_from(
-          level - T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1),
-        ));
+        w.bit((x & 0x01) as u16);
         w.phasm_set_tag(crate::ec::PHASM_TAG_OTHER);
       }
     }
