@@ -61,6 +61,7 @@ pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 // See rav1e-hook-sites.md § 3.2 + § 9 Q-OPT1.
 pub mod phasm_stego {
   pub use crate::api::PhasmInterConfig as InterConfig;
+  pub use crate::context::FrameBlocks;
   pub use crate::encoder::{encode_tile, FrameInvariants, FrameState};
   pub use crate::stats::EncoderStats;
 
