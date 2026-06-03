@@ -3982,6 +3982,19 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
   // BEFORE we get here since the tile group has already been built).
   // Arc::clone is a refcount bump — no data copy. Phasm-core's
   // J-UNIWARD cost computation reads from this snapshot.
+  // Phase B.1.5.1: capture frame-level deblock + CDEF state for
+  // phasm-core's cascade-safety v2 forward modeling.
+  // `fs.deblock.levels` was set by `deblock_filter_optimize` inside
+  // `encode_tile_group_with_phasm_tee` (call above). CDEF strength
+  // tables live on `fi` directly. See `PhasmFrameLoopFilterState`
+  // doc comment + `phasm-av1/docs/design/video/av1/phase-b15-cascade-safety-v2.md`.
+  let loop_filter_state = crate::ec::PhasmFrameLoopFilterState {
+    deblock_levels: fs.deblock.levels,
+    cdef_y_strengths: fi.cdef_y_strengths,
+    cdef_uv_strengths: fi.cdef_uv_strengths,
+    cdef_bits: fi.cdef_bits,
+    cdef_enabled: fi.sequence.enable_cdef,
+  };
   let recording = PhasmFrameRecording {
     tiles: tile_recordings,
     tile_group_offset,
@@ -3990,6 +4003,7 @@ pub fn encode_frame_with_phasm_tee<T: Pixel>(
     frame_obu_start,
     reconstructed_planes: std::sync::Arc::clone(&fs.rec),
     frame_qindex: fi.base_q_idx,
+    loop_filter_state,
   };
   (packet, recording)
 }

@@ -277,6 +277,44 @@ pub struct PhasmTileRecording {
   pub bit_meta: Vec<AcSignMeta>,
 }
 
+/// Phase B.1.5.1: frame-level loop-filter state captured at the end
+/// of `encode_frame_with_phasm_tee`, AFTER deblock + CDEF + LR have
+/// completed. Required by phasm-core's cascade-safety v2 forward
+/// modeling for the ~10-15% of cover positions whose `|coeff|` falls
+/// in the ambiguous middle band (B.1.5.0 spike confirmed `|coeff|`
+/// alone resolves ~85% of positions via EE-D's three-tier dispatch;
+/// only the middle band needs full deblock+CDEF forward prediction).
+///
+/// Per-SB CDEF index Vec is deferred to B.1.5.2 — capturing it
+/// requires walking `BlockContext` which goes out of scope at the end
+/// of `encode_tile_group_with_phasm_tee`. v0.5 forward modeling can
+/// derive a coarse approximation from the y-strength array alone.
+///
+/// See `phase-b15-cascade-safety-v2.md` § 1.1 (L2 cascade-context
+/// cache keys) + § 5 (fork-patch surface).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PhasmFrameLoopFilterState {
+  /// Frame-level deblock filter levels in rav1e's [`DeblockState::levels`]
+  /// layout: `[Y_vert, Y_horiz, U, V]`. Set by
+  /// `deblock_filter_optimize` and applied by `deblock_filter_frame`.
+  /// All-zero means deblock is disabled (e.g., lossless modes); skip
+  /// the deblock layer of forward modeling in that case.
+  pub deblock_levels: [u8; 4],
+  /// CDEF luma-plane strength table (8 entries packed as
+  /// `(primary_strength << log2(CDEF_SEC_STRENGTHS)) | secondary_strength`,
+  /// indexed by per-SB `cdef_index`). Frame-level constant.
+  pub cdef_y_strengths: [u8; 8],
+  /// CDEF chroma-plane strength table (same layout as `cdef_y_strengths`).
+  pub cdef_uv_strengths: [u8; 8],
+  /// log2 of the number of CDEF strength sets actually used by this
+  /// frame (0..=3). Per-SB `cdef_index` ranges over `0..(1 << cdef_bits)`.
+  pub cdef_bits: u8,
+  /// `true` if CDEF filtering was enabled for this frame. When
+  /// `false`, the forward model skips the CDEF layer entirely
+  /// (saves L2 cache slots).
+  pub cdef_enabled: bool,
+}
+
 /// phasm-stego (W3.10.4): full-frame recording metadata returned from
 /// `encode_frame_with_phasm_tee` + `Context::receive_packet_with_phasm_recording`.
 /// Carries per-tile recorder data AND the byte offset where the
@@ -332,6 +370,11 @@ pub struct PhasmFrameRecording<T: crate::util::Pixel = u8> {
   /// quantizer step size. Per-block delta-Q variance (when rav1e
   /// enables it) is deferred to v0.5+.
   pub frame_qindex: u8,
+  /// Phase B.1.5.1 addition: frame-level deblock + CDEF state for
+  /// cascade-safety v2 forward modeling. See
+  /// [`PhasmFrameLoopFilterState`] doc comment + the cascade-safety
+  /// v2 design doc § 5.
+  pub loop_filter_state: PhasmFrameLoopFilterState,
 }
 
 #[derive(Debug, Clone)]
