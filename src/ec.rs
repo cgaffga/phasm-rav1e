@@ -224,6 +224,30 @@ pub struct AcSignMeta {
   /// the TX block. `scan_pos = freq_y * tx_width + freq_x`. Used to
   /// look up the corresponding DCT basis vector for cost computation.
   pub scan_pos: u16,
+  /// Phase B.1.5.0.5 (cascade-safety v2): absolute value of the
+  /// quantized coefficient at this position. Captured at the encoder
+  /// side from `v.abs()` just before the AC sign bit emission (and at
+  /// the matching golomb tail LSB emit site). Saturated at `u16::MAX`
+  /// — coefficient magnitudes post-quant fit comfortably (~bounded by
+  /// `cf_max` ≈ low thousands at typical QP).
+  ///
+  /// Used by phasm-core's B.1.5 cascade-safety filter:
+  /// * **EE-D** coefficient-magnitude pre-filter: positions where
+  ///   `|coeff| × max_filter_gain < safe_threshold` skip forward
+  ///   modeling — provably safe by upper bound. Per B.1.5.0 spike
+  ///   data this rejects ~50% of cover positions cheaply.
+  /// * **EE-C** + **L3 cache key**: same `|coeff|` is the magnitude
+  ///   factor scaling the IDCT delta pattern.
+  ///
+  /// **Walker-side**: NOT populated by phasm-dav1d. The decoder walker
+  /// runs at extract time which has no cost compute, so the field
+  /// stays at default zero on the dav1d side. The parity test in
+  /// `av1_bit_meta_parity.rs` projects through `MetaParity` which
+  /// excludes this field.
+  ///
+  /// See [`phase-b15-cascade-safety-v2.md`](../../../phasm-av1/docs/design/video/av1/phase-b15-cascade-safety-v2.md)
+  /// § 5 (fork-patch surface).
+  pub coeff_magnitude: u16,
 }
 
 /// phasm-stego (W3.10.4): per-tile recorder snapshot extracted from

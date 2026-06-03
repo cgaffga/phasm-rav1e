@@ -1867,6 +1867,7 @@ impl ContextWriter<'_> {
       tx_height_log2: tx_size.height_log2() as u8,
       tx_type: tx_type as u8,
       scan_pos: 0, // overwritten per emission inside encode_coeff_signs
+      coeff_magnitude: 0, // overwritten per emission (B.1.5.0.5)
     };
     let cul_level = self.encode_coeff_signs(
       coeffs,
@@ -2041,6 +2042,12 @@ impl ContextWriter<'_> {
         // within the TX block (freq_y * tx_width + freq_x).
         let mut meta = block_meta_base;
         meta.scan_pos = scan[c];
+        // Phase B.1.5.0.5: capture absolute coefficient magnitude
+        // for cascade-safety v2's EE-D + EE-C + L3 cache key. Cap
+        // at u16::MAX — coefficient magnitudes post-quant fit
+        // comfortably (bounded by ~cf_max at typical QP).
+        meta.coeff_magnitude =
+          u32::cast_from(level).min(u16::MAX as u32) as u16;
         w.phasm_set_meta(meta);
         w.phasm_set_tag(crate::ec::PHASM_TAG_AC_COEFF_SIGN);
         w.bit(sign as u16);
@@ -2089,6 +2096,12 @@ impl ContextWriter<'_> {
         if length > 1 {
           let mut golomb_meta = block_meta_base;
           golomb_meta.scan_pos = scan[c];
+          // Phase B.1.5.0.5: same coeff_magnitude as the matching
+          // AC sign emit above — the golomb LSB flip changes |coeff|
+          // by ±1, but the pre-flip magnitude is what cascade-safety
+          // v2 needs for the EE-D / EE-C / L3 lookups.
+          golomb_meta.coeff_magnitude =
+            u32::cast_from(level).min(u16::MAX as u32) as u16;
           w.phasm_set_meta(golomb_meta);
           w.phasm_set_tag(crate::ec::PHASM_TAG_GOLOMB_TAIL_LSB);
           w.bit((x & 0x01) as u16);
