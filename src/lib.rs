@@ -80,6 +80,9 @@ pub mod phasm_stego {
     // the Context API plumbing (which would require generalizing
     // encode_normal_packet over the writer backend).
     encode_frame_with_phasm_tee,
+    // D.6: helper used by encode_gop_with_phasm_tee to chain
+    // reference frames between inter-encoded frames inside a GOP.
+    update_rec_buffer,
   };
   pub use crate::stats::EncoderStats;
 
@@ -108,6 +111,99 @@ pub mod phasm_stego {
       height,
       chroma_sampling,
     )
+  }
+
+  /// D.6 — multi-frame GOP encode with WriterTee recording for stego.
+  ///
+  /// Encodes `yuvs` as a single GOP: frame 0 is the keyframe, frames
+  /// 1..N are inter (P) frames referencing prior reconstructions. Each
+  /// frame is encoded via [`encode_frame_with_phasm_tee`], so each
+  /// returned `(packet, recording)` is wire-natural AV1 OBU bytes plus
+  /// the phasm-core recorder data needed for STC override.
+  ///
+  /// The helper internalizes the reference-buffer chaining that the
+  /// rav1e `Context::encode_normal_packet` does between frames (see
+  /// `api/internal.rs:1448-1471`): pad reconstruction, call
+  /// `update_rec_buffer`, copy `fi.rec_buffer` into the next frame's
+  /// invariants, refresh `set_ref_frame_sign_bias`. Without this
+  /// chain, inter frames have no references and either fail or fall
+  /// back to intra-only (defeating the bitrate point of D.6).
+  ///
+  /// Low-latency mode is enforced inside the helper: B-frame
+  /// reordering would require `frame_q`-based delayed emission which
+  /// the per-GOP stego flow can't accommodate. Output order = input
+  /// order, no SEFs, no reorder.
+  pub fn encode_gop_with_phasm_tee<T: crate::util::Pixel>(
+    yuvs: &[std::sync::Arc<crate::frame::Frame<T>>],
+    config: std::sync::Arc<crate::api::EncoderConfig>,
+    sequence: std::sync::Arc<crate::encoder::Sequence>,
+  ) -> Vec<(Vec<u8>, PhasmFrameRecording<T>)> {
+    assert!(!yuvs.is_empty(), "encode_gop_with_phasm_tee: empty GOP");
+    let inter_cfg = make_inter_config(&config);
+
+    let mut results = Vec::with_capacity(yuvs.len());
+
+    // Frame 0 — keyframe.
+    let mut prev_fi = FrameInvariants::<T>::new_key_frame(
+      config.clone(),
+      sequence.clone(),
+      0,
+      Box::new([]),
+    );
+    prev_fi.enable_segmentation = false;
+    let mut fs = FrameState::new_with_frame(&prev_fi, yuvs[0].clone());
+    let (packet, recording) =
+      encode_frame_with_phasm_tee(&prev_fi, &mut fs, &inter_cfg);
+    pad_and_update_ref(&mut prev_fi, &mut fs, 0);
+    results.push((packet, recording));
+
+    // Frames 1..N — inter (P) frames.
+    let next_keyframe_input_frameno = yuvs.len() as u64;
+    for (idx, yuv) in yuvs.iter().enumerate().skip(1) {
+      let output_frameno_in_gop = idx as u64;
+
+      let mut fi = FrameInvariants::<T>::new_inter_frame(
+        &prev_fi,
+        &inter_cfg,
+        0,
+        output_frameno_in_gop,
+        next_keyframe_input_frameno,
+        false,
+        Box::new([]),
+      )
+      .expect("encode_gop_with_phasm_tee: new_inter_frame returned None");
+      fi.enable_segmentation = false;
+      fi.rec_buffer = prev_fi.rec_buffer.clone();
+      fi.set_ref_frame_sign_bias();
+
+      let mut fs = FrameState::new_with_frame(&fi, yuv.clone());
+      let (packet, recording) =
+        encode_frame_with_phasm_tee(&fi, &mut fs, &inter_cfg);
+      pad_and_update_ref(&mut fi, &mut fs, output_frameno_in_gop);
+      results.push((packet, recording));
+      prev_fi = fi;
+    }
+
+    results
+  }
+
+  fn pad_and_update_ref<T: crate::util::Pixel>(
+    fi: &mut FrameInvariants<T>,
+    fs: &mut FrameState<T>,
+    output_frameno: u64,
+  ) {
+    let planes = if fi.sequence.chroma_sampling
+      == crate::color::ChromaSampling::Cs400
+    {
+      1
+    } else {
+      3
+    };
+    use crate::frame::FramePad as _;
+    std::sync::Arc::get_mut(&mut fs.rec)
+      .expect("rec Arc must be uniquely owned post-encode_frame_with_phasm_tee")
+      .pad(fi.width, fi.height, planes);
+    update_rec_buffer(output_frameno, fi, fs);
   }
 }
 
