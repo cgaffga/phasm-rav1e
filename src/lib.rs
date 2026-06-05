@@ -200,9 +200,22 @@ pub mod phasm_stego {
       3
     };
     use crate::frame::FramePad as _;
-    std::sync::Arc::get_mut(&mut fs.rec)
-      .expect("rec Arc must be uniquely owned post-encode_frame_with_phasm_tee")
-      .pad(fi.width, fi.height, planes);
+    // `encode_frame_with_phasm_tee` clones `fs.rec` into the returned
+    // `PhasmFrameRecording.reconstructed_planes` (refcount becomes 2),
+    // so `Arc::get_mut` would fail. `make_mut` copy-on-writes: it
+    // allocates a new `Frame` with the same contents, swaps `fs.rec`
+    // to point at it, and returns a unique mutable reference we can
+    // pad in place. The recording keeps the original (unpadded)
+    // Frame, which is correct — its consumer (J-UNIWARD cost
+    // computation) reads the VISIBLE region only, and filter-tap
+    // padding is outside that. The padded copy is what subsequent
+    // frame's ME reads via `fi.rec_buffer`.
+    //
+    // Cost: one Frame-pixel copy per inter-frame chain step in a
+    // GOP. ~3 MB per 1080p Y plane × gop_size frames. Bounded by
+    // per-GOP memory budget (per phase-c-streaming-session-v6.md §10
+    // ~100 MB ceiling at 1080p × 30f).
+    std::sync::Arc::make_mut(&mut fs.rec).pad(fi.width, fi.height, planes);
     update_rec_buffer(output_frameno, fi, fs);
   }
 }
