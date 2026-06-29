@@ -49,6 +49,13 @@ use crate::encoder::*;
 pub use crate::frame::Frame;
 pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 
+// phasm-stego streaming-session lookahead (Option B Phase P1, #232).
+// Free-function counterpart to ContextInner::compute_block_importances
+// for the encode_gop_with_phasm_tee path. See module docstring + the
+// implementation plan at
+// docs/design/video/av1/av1-stealth-lookahead-plan-2026-06-29.md.
+mod phasm_stego_lookahead;
+
 // phasm-stego (W3.8.3, Option 3 minimal-API):
 // Re-exports of internal types needed by phasm-core to call
 // `crate::encoder::encode_tile::<WriterRecorder>` directly. See
@@ -60,6 +67,11 @@ pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 // surface, so phasm-core doesn't depend on these internal types.
 // See rav1e-hook-sites.md § 3.2 + § 9 Q-OPT1.
 pub mod phasm_stego {
+  // P1 lookahead refinement (#232 — av1-stealth-lookahead-plan-2026-06-29.md):
+  pub use crate::phasm_stego_lookahead::{
+    compute_distortion_scales_for_window, LookaheadWindowFrame,
+  };
+
   pub use crate::api::PhasmInterConfig as InterConfig;
   pub use crate::context::FrameBlocks;
   pub use crate::ec::{
