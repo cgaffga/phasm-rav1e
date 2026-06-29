@@ -649,6 +649,117 @@ mod tests {
         );
     }
 
+    /// P2.b NO-OP DOCUMENTATION TEST (2026-06-29): with a 1-frame
+    /// window, `compute_distortion_scales_for_window` leaves
+    /// `distortion_scales` at the all-default value.
+    ///
+    /// Why this is a no-op in the 1-frame case:
+    ///   Stage 3's propagation loop is `for k in (1..n).rev()`. With
+    ///   n=1 the iterator is empty — no `update_block_importances_free`
+    ///   call ever fires, so `block_importances` stays at the
+    ///   zero-initialization pass result (all 0.0).
+    ///
+    ///   Stage 4 then computes
+    ///     `distortion_scale_for(propagate_cost=0.0, intra_cost=x)`
+    ///   for every block. Looking at `rdo::distortion_scale_for`
+    ///   (`rdo.rs:506-553`):
+    ///     frac  = (intra_cost + 0.0) / intra_cost = 1.0
+    ///     scale = 1.0.powf(1/3) = 1.0  =  DistortionScale::default()
+    ///   (the early-return guard at line 546 handles intra_cost==0
+    ///   the same way.)
+    ///
+    /// Conclusion: P2's 1-frame self-refinement variant is a
+    /// behavioural no-op on `distortion_scales`. The encoder picks
+    /// up zero downstream effect because `coded_frame_data
+    /// .distortion_scales` ends up bit-identical to the pre-call state.
+    /// `lookahead_intra_costs` *is* repopulated (see prior test), but
+    /// that field by itself is never read in the byte-output path —
+    /// only the `distortion_scales` it gets transformed into via
+    /// stage 4 is.
+    ///
+    /// The real lookahead-refinement value requires a multi-frame
+    /// window (n ≥ 2) where stage 3 actually executes and propagates
+    /// non-zero `block_importances` backwards into window[0]. Multi-
+    /// frame propagation requires proxy `ReferenceFrame`s wrapping
+    /// source YUVs (rav1e CLI trick at `internal.rs:731-754`) — that's
+    /// the remaining P2 work item.
+    #[test]
+    fn one_frame_window_leaves_distortion_scales_at_default() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let cfg = make_default_config(W, H);
+        let sequence = Arc::new(Sequence::new(&cfg));
+        let inter_cfg = crate::api::PhasmInterConfig::new(&cfg);
+
+        let yuv: Arc<Frame<u8>> = Arc::new(
+            <Frame<u8> as FrameAlloc>::new(W, H, ChromaSampling::Cs420),
+        );
+
+        let mut fi = FrameInvariants::<u8>::new_key_frame(
+            cfg.clone(),
+            sequence.clone(),
+            0,
+            Box::new([]),
+        );
+        fi.enable_segmentation = false;
+        let fs = FrameState::new_with_frame(&fi, Arc::clone(&yuv));
+
+        let mut window = vec![LookaheadWindowFrame {
+            fi,
+            fs,
+            yuv,
+            output_frameno: 0,
+        }];
+
+        // Snapshot the default DistortionScale value for comparison.
+        let default_scale = crate::rdo::DistortionScale::default();
+
+        // Before: distortion_scales is initialized to default by
+        // CodedFrameData::new (uniform fixed-point 1.0).
+        let initial_len = window[0]
+            .fi
+            .coded_frame_data
+            .as_ref()
+            .expect("KEY frame should have coded_frame_data")
+            .distortion_scales
+            .len();
+        let initial_all_default = window[0]
+            .fi
+            .coded_frame_data
+            .as_ref()
+            .unwrap()
+            .distortion_scales
+            .iter()
+            .all(|&s| s.0 == default_scale.0);
+        assert!(
+            initial_all_default,
+            "fresh CodedFrameData should have distortion_scales all == default"
+        );
+        assert!(initial_len > 0, "distortion_scales should be non-empty");
+
+        compute_distortion_scales_for_window(&mut window, &inter_cfg, 8);
+
+        // After: with a 1-frame window, stage 4 should still leave
+        // every entry at the default value (see test docstring).
+        let after = &window[0]
+            .fi
+            .coded_frame_data
+            .as_ref()
+            .unwrap()
+            .distortion_scales;
+        let after_all_default =
+            after.iter().all(|&s| s.0 == default_scale.0);
+        assert!(
+            after_all_default,
+            "1-frame self-refinement should leave distortion_scales at \
+             default — but found {} of {} entries differing from default. \
+             See test docstring for the algebra: propagate_cost=0 (stage 3 \
+             empty for n=1) ⇒ frac=1 ⇒ scale=1.0=default.",
+            after.iter().filter(|s| s.0 != default_scale.0).count(),
+            after.len(),
+        );
+    }
+
     /// P2 smoke test: with `PHASM_AV1_LOOKAHEAD=1` set,
     /// `encode_gop_with_phasm_tee` runs the 1-frame self-refinement
     /// pass via `run_one_frame_lookahead` (the move-into-window +
