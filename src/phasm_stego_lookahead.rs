@@ -545,6 +545,11 @@ mod tests {
         cfg.height = h;
         cfg.bit_depth = 8;
         cfg.chroma_sampling = ChromaSampling::Cs420;
+        // Mirror what phasm-core's encode_gop_natural pins for the
+        // streaming-session path (whole_video.rs::encode_gop_natural).
+        // Without low_latency=true, new_inter_frame returns None
+        // because the default config schedules B-frame reordering.
+        cfg.low_latency = true;
         Arc::new(cfg)
     }
 
@@ -641,6 +646,63 @@ mod tests {
             coded.block_importances.len(),
             expected_len,
             "block_importances length should match w_in_imp_b * h_in_imp_b"
+        );
+    }
+
+    /// P2 smoke test: with `PHASM_AV1_LOOKAHEAD=1` set,
+    /// `encode_gop_with_phasm_tee` runs the 1-frame self-refinement
+    /// pass via `run_one_frame_lookahead` (the move-into-window +
+    /// pop-back-out placeholder dance) before each frame's encode
+    /// without panicking.
+    ///
+    /// This is a crash-safety test only — it doesn't assert anything
+    /// about the encoded bytes (cargo test env-var sharing across
+    /// parallel tests is unsafe, so we can't reliably bracket an
+    /// env-off encode and an env-on encode in the same test).
+    /// Behavioural validation of the lookahead refinement comes via
+    /// P5's stealth audit re-run on a fresh CLI invocation with the
+    /// env knob set.
+    #[test]
+    fn p2_env_knob_on_does_not_crash() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let cfg = make_default_config(W, H);
+        let sequence = Arc::new(Sequence::new(&cfg));
+
+        let yuvs: Vec<Arc<Frame<u8>>> = (0..2)
+            .map(|_| {
+                Arc::new(<Frame<u8> as FrameAlloc>::new(
+                    W,
+                    H,
+                    ChromaSampling::Cs420,
+                ))
+            })
+            .collect();
+
+        // SAFETY: set_var is unsafe in 2024 edition; this test must
+        // run with --test-threads=1 to avoid racing with any future
+        // test that also touches this env var. Today no other test
+        // reads PHASM_AV1_LOOKAHEAD.
+        std::env::set_var("PHASM_AV1_LOOKAHEAD", "1");
+        let results = crate::phasm_stego::encode_gop_with_phasm_tee::<u8>(
+            &yuvs,
+            cfg,
+            sequence,
+        );
+        std::env::remove_var("PHASM_AV1_LOOKAHEAD");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "encode_gop_with_phasm_tee should return one (packet, recording) pair per frame"
+        );
+        assert!(
+            !results[0].0.is_empty(),
+            "frame 0 packet bytes should be non-empty"
+        );
+        assert!(
+            !results[1].0.is_empty(),
+            "frame 1 packet bytes should be non-empty"
         );
     }
 }
