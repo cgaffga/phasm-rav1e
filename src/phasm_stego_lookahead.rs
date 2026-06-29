@@ -167,32 +167,37 @@ pub fn compute_distortion_scales_for_window<T: Pixel>(
     }
 
     // TODO P1.c: stage 2 — for each non-keyframe in window:
-    // Stage 2 (P1.c 2026-06-29): per-frame intra-cost estimation.
+    // Stage 2 (P1.c 2026-06-29, refined post-P1.e): per-frame
+    // intra-cost estimation.
     //
-    // For each non-keyframe in the window, populate
-    // `fi.coded_frame_data.lookahead_intra_costs` via
+    // For each non-SEF frame in the window — **including keyframes** —
+    // populate `fi.coded_frame_data.lookahead_intra_costs` via
     // `estimate_intra_costs`. Mirror of
     // `ContextInner::compute_lookahead_intra_costs`
-    // (`api/internal.rs:838-877`). Differences from the rav1e CLI path:
+    // (`api/internal.rs:838-877`), which gates only on
+    // `is_show_existing_frame`, NOT on `frame_type`.
     //
+    // Keyframes DO need this populated because stage 4 (finalization)
+    // reads window[0]'s lookahead_intra_costs unconditionally — and in
+    // phasm's streaming-session model window[0] is the IDR for the
+    // first frame of every GOP. Skipping keyframes here was a P1.c
+    // first-draft bug fixed at the P1.e checkpoint.
+    //
+    // Differences from rav1e CLI path:
     //   - rav1e's ContextInner caches per-frame intra-cost arrays in
     //     `keyframe_detector.intra_costs` during scene-change detection
-    //     (lookahead.rs scenecut pass) and pulls them out lazily here.
-    //     Phasm has no scene-change detector in the streaming session
-    //     (low_latency=true, no scenecut analysis), so we always go down
-    //     the fresh-compute branch (the `unwrap_or_else` arm in the
-    //     original). Slightly more work per frame than rav1e CLI but
-    //     functionally identical.
+    //     and pulls them out lazily. Phasm has no scene-change detector
+    //     in the streaming session (low_latency=true, no scenecut
+    //     analysis), so we always go down the fresh-compute branch
+    //     (the `unwrap_or_else` arm in the original). Slightly more
+    //     work per frame than rav1e CLI but functionally identical.
     //
-    //   - The `is_show_existing_frame` check is preserved out of
-    //     paranoia: phasm's streaming session encodes one tile group
-    //     per real frame and never emits SEFs, so this branch is dead
-    //     code today. Keeping it makes the function defensive against
-    //     a future refactor.
+    //   - `is_show_existing_frame` check is preserved out of paranoia:
+    //     phasm's streaming session encodes one tile group per real
+    //     frame and never emits SEFs, so this branch is dead code
+    //     today. Keeping it makes the function defensive against a
+    //     future refactor.
     for frame in window.iter_mut() {
-        if frame.fi.frame_type == FrameType::KEY {
-            continue;
-        }
         if frame.fi.is_show_existing_frame() {
             continue;
         }
@@ -209,7 +214,7 @@ pub fn compute_distortion_scales_for_window<T: Pixel>(
             .fi
             .coded_frame_data
             .as_mut()
-            .expect("coded_frame_data must be set on inter frames")
+            .expect("coded_frame_data must be set after new_key_frame / new_inter_frame")
             .lookahead_intra_costs = intra_costs;
     }
 
@@ -530,20 +535,112 @@ pub(crate) fn update_block_importances_free<T: Pixel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::ChromaSampling;
+    use crate::encoder::Sequence;
+    use crate::frame::FrameAlloc;
+
+    fn make_default_config(w: usize, h: usize) -> Arc<crate::api::EncoderConfig> {
+        let mut cfg = crate::api::EncoderConfig::default();
+        cfg.width = w;
+        cfg.height = h;
+        cfg.bit_depth = 8;
+        cfg.chroma_sampling = ChromaSampling::Cs420;
+        Arc::new(cfg)
+    }
 
     /// P1.a smoke test: function is callable from the phasm_stego
-    /// re-export and an empty window doesn't panic. Real behavioural
-    /// gates land in P1.f.
+    /// re-export and an empty window doesn't panic.
     #[test]
     fn empty_window_is_noop() {
         let mut window: Vec<LookaheadWindowFrame<u8>> = Vec::new();
-        // We need an InterConfig to call; construct a default one via
-        // the smallest-possible EncoderConfig.
-        let mut cfg = crate::api::EncoderConfig::default();
-        cfg.width = 16;
-        cfg.height = 16;
+        let cfg = make_default_config(16, 16);
         let inter_cfg = crate::api::PhasmInterConfig::new(&cfg);
         compute_distortion_scales_for_window(&mut window, &inter_cfg, 8);
         assert!(window.is_empty());
+    }
+
+    /// P1.f behavioural test: stage 2 (intra-cost estimation) must
+    /// populate `lookahead_intra_costs` on **keyframes** too — not
+    /// just inter frames.
+    ///
+    /// In phasm's streaming-session model, `window[0]` is the IDR for
+    /// the first frame of every GOP. Stage 4 (finalization) reads
+    /// `window[0].fi.coded_frame_data.lookahead_intra_costs`
+    /// unconditionally — if stage 2 skipped the keyframe, the array
+    /// would stay at its `Box::new([])` default and stage 4 would be
+    /// a no-op (zipping an empty iterator with `distortion_scales`).
+    ///
+    /// rav1e's own `compute_lookahead_intra_costs`
+    /// (`api/internal.rs:838-877`) only gates on
+    /// `is_show_existing_frame`, NOT `frame_type == KEY` — so for
+    /// behaviour-parity we must do the same.
+    ///
+    /// This test catches a P1.c first-draft bug where stage 2 had a
+    /// `if frame_type == KEY { continue; }` filter (fixed at the
+    /// P1.e checkpoint).
+    #[test]
+    fn keyframe_window_populates_lookahead_intra_costs() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let cfg = make_default_config(W, H);
+        let sequence = Arc::new(Sequence::new(&cfg));
+        let inter_cfg = crate::api::PhasmInterConfig::new(&cfg);
+
+        let yuv: Arc<Frame<u8>> = Arc::new(
+            <Frame<u8> as FrameAlloc>::new(W, H, ChromaSampling::Cs420),
+        );
+
+        let mut fi = FrameInvariants::<u8>::new_key_frame(
+            cfg.clone(),
+            sequence.clone(),
+            0,
+            Box::new([]),
+        );
+        fi.enable_segmentation = false;
+        let fs = FrameState::new_with_frame(&fi, Arc::clone(&yuv));
+
+        let mut window = vec![LookaheadWindowFrame {
+            fi,
+            fs,
+            yuv,
+            output_frameno: 0,
+        }];
+
+        // Before: CodedFrameData::new initializes lookahead_intra_costs
+        // to Box::new([]).
+        let initial_len = window[0]
+            .fi
+            .coded_frame_data
+            .as_ref()
+            .expect("KEY frame should have coded_frame_data")
+            .lookahead_intra_costs
+            .len();
+        assert_eq!(
+            initial_len, 0,
+            "lookahead_intra_costs should start empty on a fresh KEY frame"
+        );
+
+        compute_distortion_scales_for_window(&mut window, &inter_cfg, 8);
+
+        // After: stage 2 should have populated lookahead_intra_costs
+        // to w_in_imp_b * h_in_imp_b entries on the KEY frame.
+        let coded = window[0].fi.coded_frame_data.as_ref().unwrap();
+        let after_len = coded.lookahead_intra_costs.len();
+        let expected_len = coded.w_in_imp_b * coded.h_in_imp_b;
+        assert_eq!(
+            after_len, expected_len,
+            "stage 2 should populate lookahead_intra_costs on KEY frames \
+             (w_in_imp_b={} h_in_imp_b={} → expected={} entries, got={})",
+            coded.w_in_imp_b, coded.h_in_imp_b, expected_len, after_len
+        );
+
+        // Also: block_importances must remain w_in_imp_b * h_in_imp_b
+        // (initialized by CodedFrameData::new; stage 3's zero-init
+        // pass should preserve length).
+        assert_eq!(
+            coded.block_importances.len(),
+            expected_len,
+            "block_importances length should match w_in_imp_b * h_in_imp_b"
+        );
     }
 }
