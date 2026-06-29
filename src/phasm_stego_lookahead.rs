@@ -48,6 +48,7 @@
 use std::sync::Arc;
 
 use crate::api::PhasmInterConfig as InterConfig;
+use crate::api::FrameType;
 use crate::encoder::{FrameInvariants, FrameState};
 use crate::frame::Frame;
 use crate::util::Pixel;
@@ -120,19 +121,47 @@ pub struct LookaheadWindowFrame<T: Pixel> {
 /// lookahead. P1.b-e fill in the stages incrementally.
 pub fn compute_distortion_scales_for_window<T: Pixel>(
     window: &mut [LookaheadWindowFrame<T>],
-    _inter_cfg: &InterConfig,
+    inter_cfg: &InterConfig,
     _bit_depth: usize,
 ) {
     if window.is_empty() {
         return;
     }
-    // TODO P1.b: stage 1 — for each non-keyframe in window:
-    //     crate::api::lookahead::compute_motion_vectors(
-    //         &mut window[k].fi, &mut window[k].fs, inter_cfg);
+
+    // Stage 1 (P1.b 2026-06-29): per-frame motion estimation.
     //
+    // Populates `fs.frame_me_stats` for each non-keyframe in the
+    // window. Mirror of what `ContextInner::compute_frame_invariants`
+    // (`api/internal.rs:898-908`) does during lookahead intake: it
+    // calls `compute_lookahead_motion_vectors` once per frame as the
+    // frame enters the lookahead window. We do the same here, except
+    // straight on the window slice instead of through the BTreeMap.
+    //
+    // Keyframes are skipped — they have no inter prediction, so no
+    // me_stats are needed and `compute_motion_vectors` would do
+    // wasted work on them anyway.
+    //
+    // `fi.rec_buffer` MUST be populated before this call for inter
+    // frames (the ME pass uses `rec_buffer.frames[r]` to fetch each
+    // reference). Caller's responsibility — `encode_gop_with_phasm_tee`
+    // already chains `rec_buffer` between frames via
+    // `pad_and_update_ref`.
+    for frame in window.iter_mut() {
+        if frame.fi.frame_type != FrameType::KEY {
+            crate::api::lookahead::compute_motion_vectors(
+                &mut frame.fi,
+                &mut frame.fs,
+                inter_cfg,
+            );
+        }
+    }
+
     // TODO P1.c: stage 2 — for each non-keyframe in window:
-    //     populate window[k].fi.coded_frame_data.lookahead_intra_costs via
-    //     crate::api::lookahead::estimate_intra_costs(...)
+    // TODO P1.c: stage 2 — for each non-keyframe in window, populate
+    //     window[k].fi.coded_frame_data.lookahead_intra_costs via
+    //     crate::api::lookahead::estimate_intra_costs(...). Mirror of
+    //     ContextInner::compute_lookahead_intra_costs at
+    //     internal.rs:838-877.
     //
     // TODO P1.d: stage 3 — backwards propagation loop (mirror of
     //     internal.rs:1095-1209). For each output_frameno from latest
