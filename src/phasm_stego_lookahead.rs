@@ -45,12 +45,22 @@
 //         and a byte-comparison gate against a rav1e-CLI reference run
 //         with the same lookahead window.
 
+use std::mem;
 use std::sync::Arc;
+
+use arrayvec::ArrayVec;
 
 use crate::api::PhasmInterConfig as InterConfig;
 use crate::api::FrameType;
-use crate::encoder::{FrameInvariants, FrameState};
-use crate::frame::Frame;
+use crate::api::lookahead::{
+    IMP_BLOCK_AREA_IN_MV_UNITS, IMP_BLOCK_MV_UNITS_PER_PIXEL,
+    IMP_BLOCK_SIZE_IN_MV_UNITS,
+};
+use crate::dist::get_satd;
+use crate::encoder::{FrameInvariants, FrameState, IMPORTANCE_BLOCK_SIZE};
+use crate::frame::{AsRegion, Frame};
+use crate::partition::BlockSize;
+use crate::tiling::Area;
 use crate::util::Pixel;
 
 /// One frame in a lookahead window. The window is a contiguous slice in
@@ -157,23 +167,180 @@ pub fn compute_distortion_scales_for_window<T: Pixel>(
     }
 
     // TODO P1.c: stage 2 — for each non-keyframe in window:
-    // TODO P1.c: stage 2 — for each non-keyframe in window, populate
-    //     window[k].fi.coded_frame_data.lookahead_intra_costs via
-    //     crate::api::lookahead::estimate_intra_costs(...). Mirror of
-    //     ContextInner::compute_lookahead_intra_costs at
-    //     internal.rs:838-877.
+    // Stage 2 (P1.c 2026-06-29): per-frame intra-cost estimation.
     //
-    // TODO P1.d: stage 3 — backwards propagation loop (mirror of
-    //     internal.rs:1095-1209). For each output_frameno from latest
-    //     down to window[1].output_frameno: for each unique reference,
-    //     call update_block_importances(...) once. The reference frame
-    //     lookup goes through window.iter_mut().find(|f| f.output_frameno
-    //     == ref_n) instead of self.frame_data.get_mut(&ref_n).
+    // For each non-keyframe in the window, populate
+    // `fi.coded_frame_data.lookahead_intra_costs` via
+    // `estimate_intra_costs`. Mirror of
+    // `ContextInner::compute_lookahead_intra_costs`
+    // (`api/internal.rs:838-877`). Differences from the rav1e CLI path:
     //
-    // TODO P1.e: stage 4 — finalization (mirror of internal.rs:1211-1230).
-    //     For window[0]: zip block_importances + lookahead_intra_costs +
-    //     distortion_scales, write distortion_scale_for(propagate_cost,
-    //     intra_cost) into each slot.
+    //   - rav1e's ContextInner caches per-frame intra-cost arrays in
+    //     `keyframe_detector.intra_costs` during scene-change detection
+    //     (lookahead.rs scenecut pass) and pulls them out lazily here.
+    //     Phasm has no scene-change detector in the streaming session
+    //     (low_latency=true, no scenecut analysis), so we always go down
+    //     the fresh-compute branch (the `unwrap_or_else` arm in the
+    //     original). Slightly more work per frame than rav1e CLI but
+    //     functionally identical.
+    //
+    //   - The `is_show_existing_frame` check is preserved out of
+    //     paranoia: phasm's streaming session encodes one tile group
+    //     per real frame and never emits SEFs, so this branch is dead
+    //     code today. Keeping it makes the function defensive against
+    //     a future refactor.
+    for frame in window.iter_mut() {
+        if frame.fi.frame_type == FrameType::KEY {
+            continue;
+        }
+        if frame.fi.is_show_existing_frame() {
+            continue;
+        }
+        let bit_depth = frame.fi.sequence.bit_depth;
+        let cpu_feature_level = frame.fi.cpu_feature_level;
+        let mut temp_plane = frame.yuv.planes[0].clone();
+        let intra_costs = crate::api::lookahead::estimate_intra_costs(
+            &mut temp_plane,
+            &frame.yuv,
+            bit_depth,
+            cpu_feature_level,
+        );
+        frame
+            .fi
+            .coded_frame_data
+            .as_mut()
+            .expect("coded_frame_data must be set on inter frames")
+            .lookahead_intra_costs = intra_costs;
+    }
+
+    // Stage 3 (P1.d.2 2026-06-29): backwards importance propagation.
+    //
+    // Mirror of internal.rs:1095-1209. Walk the window from latest to
+    // window[1] (skip window[0] — its block_importances accumulate
+    // from every later frame; the finalization in stage 4 reads it).
+    // For each non-keyframe k, find the unique references and for each
+    // call update_block_importances_free, which propagates the
+    // importance back into the referenced frame's accumulator.
+    //
+    // Borrow-checker note: the original uses BTreeMap::remove + insert
+    // to break the aliasing between the current frame's `fi` and the
+    // referenced frame's `block_importances` mutation. Slices can't
+    // remove. We use std::mem::take instead — swap the referenced
+    // frame's `block_importances` Box<[f32]> with the Default
+    // (an empty boxed slice), do the propagation against the taken
+    // buffer (now an owned local), then put it back. Zero-allocation
+    // at the Box level — just moves the buffer ptr.
+    let bsize = BlockSize::from_width_and_height(
+        IMPORTANCE_BLOCK_SIZE,
+        IMPORTANCE_BLOCK_SIZE,
+    );
+
+    // Initialize block_importances to 0 on every frame in window.
+    for frame in window.iter_mut() {
+        if let Some(coded) = frame.fi.coded_frame_data.as_mut() {
+            for x in coded.block_importances.iter_mut() {
+                *x = 0.0;
+            }
+        }
+    }
+
+    let output_framenos: Vec<u64> =
+        window.iter().map(|f| f.output_frameno).collect();
+    let n = output_framenos.len();
+
+    for k in (1..n).rev() {
+        if window[k].fi.frame_type == FrameType::KEY {
+            continue;
+        }
+
+        // Collect unique reference indices (≤ 3 per AV1 spec).
+        let mut unique_indices: ArrayVec<(usize, u8), 3> = ArrayVec::new();
+        for (mv_index, &rec_index) in window[k].fi.ref_frames.iter().enumerate()
+        {
+            if !unique_indices.iter().any(|&(_, r)| r == rec_index) {
+                unique_indices.push((mv_index, rec_index));
+            }
+        }
+        let bit_depth = window[k].fi.sequence.bit_depth;
+        let len = unique_indices.len();
+
+        // Snapshot the me_stats Arc so the guard's lifetime is
+        // independent of window borrows below.
+        let me_stats_arc = window[k].fs.frame_me_stats.clone();
+        let me_stats_guard = me_stats_arc.read().expect("poisoned lock");
+
+        for &(mv_index, rec_index) in unique_indices.iter() {
+            let reference_arc =
+                match window[k].fi.rec_buffer.frames[rec_index as usize].as_ref()
+                {
+                    Some(r) => Arc::clone(r),
+                    None => continue,
+                };
+            let ref_output_frameno = reference_arc.output_frameno;
+            let reference_frame_arc = Arc::clone(&reference_arc.frame);
+
+            debug_assert_ne!(ref_output_frameno, window[k].output_frameno);
+
+            let ref_idx = match output_framenos
+                .iter()
+                .position(|&m| m == ref_output_frameno)
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            if ref_idx == k {
+                continue;
+            }
+
+            // Swap ref's block_importances out of the window so we can
+            // immutably borrow window[k] without aliasing window[ref_idx].
+            let mut taken_bi =
+                match window[ref_idx].fi.coded_frame_data.as_mut() {
+                    Some(c) => mem::take(&mut c.block_importances),
+                    None => continue,
+                };
+
+            update_block_importances_free(
+                &window[k].fi,
+                &me_stats_guard[mv_index],
+                &window[k].yuv,
+                &reference_frame_arc,
+                bit_depth,
+                bsize,
+                len,
+                &mut taken_bi,
+            );
+
+            // Put it back.
+            window[ref_idx]
+                .fi
+                .coded_frame_data
+                .as_mut()
+                .expect("coded_frame_data was set when we took block_importances")
+                .block_importances = taken_bi;
+        }
+
+        drop(me_stats_guard);
+    }
+
+    // Stage 4 (P1.e 2026-06-29): finalization for window[0].
+    //
+    // Convert window[0]'s accumulated block_importances + lookahead
+    // intra-costs into the per-block `distortion_scales` the encoder
+    // reads during mode decision. Mirror of internal.rs:1211-1230.
+    if let Some(coded) = window[0].fi.coded_frame_data.as_mut() {
+        let block_importances = coded.block_importances.iter();
+        let lookahead_intra_costs = coded.lookahead_intra_costs.iter();
+        let distortion_scales = coded.distortion_scales.iter_mut();
+        for ((&propagate_cost, &intra_cost), distortion_scale) in
+            block_importances.zip(lookahead_intra_costs).zip(distortion_scales)
+        {
+            *distortion_scale = crate::rdo::distortion_scale_for(
+                propagate_cost as f64,
+                intra_cost as f64,
+            );
+        }
+    }
 }
 
 /// Internal helper extracted from `ContextInner::update_block_importances`
@@ -181,22 +348,183 @@ pub fn compute_distortion_scales_for_window<T: Pixel>(
 /// the original was a method that didn't read `self` (all state came
 /// through arguments), so it's a clean lift.
 ///
-/// P1.a checkpoint: stub only. Body lands in P1.d alongside the
-/// propagation loop.
-#[allow(dead_code, clippy::too_many_arguments)]
+/// Propagates importance from `fi`'s block_importances accumulator into
+/// `reference_frame_block_importances` via the per-MB MV ME stats. Per
+/// (impl-block, current-MV-block):
+///
+/// 1. Compute SATD of current MV-block against the referenced location
+///    using `me_stats[mv_index]`.
+/// 2. Compute `propagate_fraction = max(0, 1 - inter_cost / intra_cost)`
+///    — how much of the importance "flows backward" through this ref.
+/// 3. Split the propagated amount across the 4 reference-grid blocks
+///    that the MV-block straddles (bilinear-ish — fractions weighted by
+///    overlap area in MV-unit space).
+///
+/// Body verbatim from internal.rs:912-1071 with `Self::` → free and
+/// no other changes. Keep this in sync with the original when rav1e
+/// upstream evolves the function.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_block_importances_free<T: Pixel>(
-    _fi: &FrameInvariants<T>,
-    _me_stats: &crate::me::FrameMEStats,
-    _frame: &Frame<T>,
-    _reference_frame: &Frame<T>,
-    _bit_depth: usize,
-    _bsize: crate::partition::BlockSize,
-    _len: usize,
-    _reference_frame_block_importances: &mut [f32],
+    fi: &FrameInvariants<T>,
+    me_stats: &crate::me::FrameMEStats,
+    frame: &Frame<T>,
+    reference_frame: &Frame<T>,
+    bit_depth: usize,
+    bsize: BlockSize,
+    len: usize,
+    reference_frame_block_importances: &mut [f32],
 ) {
-    // TODO P1.d: copy the body of ContextInner::update_block_importances
-    // verbatim (api/internal.rs:912-1071). The method body uses no
-    // `&self`, so the lift is mechanical.
+    let coded_data = fi.coded_frame_data.as_ref().unwrap();
+    let plane_org = &frame.planes[0];
+    let plane_ref = &reference_frame.planes[0];
+    let lookahead_intra_costs_lines =
+        coded_data.lookahead_intra_costs.chunks_exact(coded_data.w_in_imp_b);
+    let block_importances_lines =
+        coded_data.block_importances.chunks_exact(coded_data.w_in_imp_b);
+
+    lookahead_intra_costs_lines
+        .zip(block_importances_lines)
+        .zip(me_stats.rows_iter().step_by(2))
+        .enumerate()
+        .flat_map(
+            |(y, ((lookahead_intra_costs, block_importances), me_stats_line))| {
+                lookahead_intra_costs
+                    .iter()
+                    .zip(block_importances.iter())
+                    .zip(me_stats_line.iter().step_by(2))
+                    .enumerate()
+                    .map(move |(x, ((&intra_cost, &future_importance), &me_stat))| {
+                        let mv = me_stat.mv;
+
+                        // Coordinates of the top-left corner of the reference block,
+                        // in MV units.
+                        let reference_x =
+                            x as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.col as i64;
+                        let reference_y =
+                            y as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.row as i64;
+
+                        let region_org = plane_org.region(Area::Rect {
+                            x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                            y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                            width: IMPORTANCE_BLOCK_SIZE,
+                            height: IMPORTANCE_BLOCK_SIZE,
+                        });
+
+                        let region_ref = plane_ref.region(Area::Rect {
+                            x: reference_x as isize
+                                / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
+                            y: reference_y as isize
+                                / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
+                            width: IMPORTANCE_BLOCK_SIZE,
+                            height: IMPORTANCE_BLOCK_SIZE,
+                        });
+
+                        let inter_cost = get_satd(
+                            &region_org,
+                            &region_ref,
+                            bsize.width(),
+                            bsize.height(),
+                            bit_depth,
+                            fi.cpu_feature_level,
+                        ) as f32;
+
+                        let intra_cost = intra_cost as f32;
+
+                        let propagate_fraction = if intra_cost <= inter_cost {
+                            0.
+                        } else {
+                            1. - inter_cost / intra_cost
+                        };
+
+                        let propagate_amount = (intra_cost + future_importance)
+                            * propagate_fraction
+                            / len as f32;
+                        (propagate_amount, reference_x, reference_y)
+                    })
+            },
+        )
+        .for_each(|(propagate_amount, reference_x, reference_y)| {
+            let mut propagate =
+                |block_x_in_mv_units, block_y_in_mv_units, fraction| {
+                    let x = block_x_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
+                    let y = block_y_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
+
+                    // TODO: propagate partially if the block is partially off-frame
+                    // (possible on right and bottom edges)?
+                    if x >= 0
+                        && y >= 0
+                        && (x as usize) < coded_data.w_in_imp_b
+                        && (y as usize) < coded_data.h_in_imp_b
+                    {
+                        reference_frame_block_importances
+                            [y as usize * coded_data.w_in_imp_b + x as usize] +=
+                            propagate_amount * fraction;
+                    }
+                };
+
+            // Coordinates of the top-left corner of the block intersecting the
+            // reference block from the top-left.
+            let top_left_block_x = (reference_x
+                - if reference_x < 0 { IMP_BLOCK_SIZE_IN_MV_UNITS - 1 } else { 0 })
+                / IMP_BLOCK_SIZE_IN_MV_UNITS
+                * IMP_BLOCK_SIZE_IN_MV_UNITS;
+            let top_left_block_y = (reference_y
+                - if reference_y < 0 { IMP_BLOCK_SIZE_IN_MV_UNITS - 1 } else { 0 })
+                / IMP_BLOCK_SIZE_IN_MV_UNITS
+                * IMP_BLOCK_SIZE_IN_MV_UNITS;
+
+            debug_assert!(reference_x >= top_left_block_x);
+            debug_assert!(reference_y >= top_left_block_y);
+
+            let top_right_block_x = top_left_block_x + IMP_BLOCK_SIZE_IN_MV_UNITS;
+            let top_right_block_y = top_left_block_y;
+            let bottom_left_block_x = top_left_block_x;
+            let bottom_left_block_y =
+                top_left_block_y + IMP_BLOCK_SIZE_IN_MV_UNITS;
+            let bottom_right_block_x = top_right_block_x;
+            let bottom_right_block_y = bottom_left_block_y;
+
+            let top_left_block_fraction = ((top_right_block_x - reference_x)
+                * (bottom_left_block_y - reference_y))
+                as f32
+                / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+            propagate(top_left_block_x, top_left_block_y, top_left_block_fraction);
+
+            let top_right_block_fraction =
+                ((reference_x + IMP_BLOCK_SIZE_IN_MV_UNITS - top_right_block_x)
+                    * (bottom_left_block_y - reference_y)) as f32
+                    / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+            propagate(
+                top_right_block_x,
+                top_right_block_y,
+                top_right_block_fraction,
+            );
+
+            let bottom_left_block_fraction = ((top_right_block_x - reference_x)
+                * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS - bottom_left_block_y))
+                as f32
+                / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+            propagate(
+                bottom_left_block_x,
+                bottom_left_block_y,
+                bottom_left_block_fraction,
+            );
+
+            let bottom_right_block_fraction =
+                ((reference_x + IMP_BLOCK_SIZE_IN_MV_UNITS - top_right_block_x)
+                    * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS - bottom_left_block_y))
+                    as f32
+                    / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+            propagate(
+                bottom_right_block_x,
+                bottom_right_block_y,
+                bottom_right_block_fraction,
+            );
+        });
 }
 
 #[cfg(test)]
