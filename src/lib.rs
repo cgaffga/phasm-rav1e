@@ -125,6 +125,96 @@ pub mod phasm_stego {
     )
   }
 
+  /// Read the `PHASM_AV1_LOOKAHEAD` env knob. Returns true when set to
+  /// any non-zero parseable value. Default: false.
+  ///
+  /// **2026-06-29 (Option B Phase P2):** when enabled,
+  /// [`encode_gop_with_phasm_tee`] runs a 1-frame self-refinement pass
+  /// via [`crate::phasm_stego::compute_distortion_scales_for_window`]
+  /// before each frame's encode. This pre-populates
+  /// `lookahead_intra_costs` and writes refined `distortion_scales`
+  /// into `fi.coded_frame_data` based on the per-block intra-cost
+  /// estimate. The encoder picks this up during mode decision —
+  /// content-dependent λ weighting rather than uniform default.
+  ///
+  /// Multi-frame propagation (stage 3 of the lookahead pipeline)
+  /// requires constructing lookahead-frame FIs with proxy
+  /// `rec_buffer`s that point at source frames (the trick rav1e CLI
+  /// uses). That extension is deferred to a follow-on commit. 1-frame
+  /// self-refinement already exercises stages 1, 2, and 4.
+  ///
+  /// When disabled (default), behaviour is byte-identical to the
+  /// pre-P2 baseline — the existing AV1 byte-identity gates continue
+  /// to pass without re-baselining.
+  fn lookahead_enabled() -> bool {
+    std::env::var("PHASM_AV1_LOOKAHEAD")
+      .ok()
+      .and_then(|s| s.parse::<u8>().ok())
+      .map(|n| n != 0)
+      .unwrap_or(false)
+  }
+
+  /// Run a 1-frame lookahead refinement pass on `(fi, fs, yuv)`
+  /// before its `encode_frame_with_phasm_tee` call. Move-into-window
+  /// + pop-back-out so the function's owning slice API
+  /// (`compute_distortion_scales_for_window`) can mutate the FI/FS
+  /// state in place.
+  ///
+  /// Stages 1 + 2 + 4 of the pipeline run on the 1-frame window;
+  /// stage 3 (backwards propagation) is a no-op for n=1. The end
+  /// effect is that `fi.coded_frame_data.distortion_scales` is
+  /// rewritten from its uniform default to a per-block value derived
+  /// from `lookahead_intra_costs` via `rdo::distortion_scale_for`.
+  fn run_one_frame_lookahead<T: crate::util::Pixel>(
+    fi: &mut FrameInvariants<T>,
+    fs: &mut FrameState<T>,
+    yuv: std::sync::Arc<crate::frame::Frame<T>>,
+    output_frameno: u64,
+    inter_cfg: &InterConfig,
+    bit_depth: usize,
+  ) {
+    // Take owned fi + fs out of the caller's storage so we can move
+    // them into the lookahead window. They get put back at the end.
+    // The placeholders are constructed via uninit + immediate
+    // overwrite — Rust enforces correct usage at type level.
+    let owned_fi = std::mem::replace(
+      fi,
+      FrameInvariants::<T>::new_key_frame(
+        fi.config.clone(),
+        fi.sequence.clone(),
+        0,
+        Box::new([]),
+      ),
+    );
+    let owned_fs = std::mem::replace(
+      fs,
+      FrameState::new_with_frame(fi, std::sync::Arc::clone(&yuv)),
+    );
+
+    let mut window =
+      vec![crate::phasm_stego_lookahead::LookaheadWindowFrame {
+        fi: owned_fi,
+        fs: owned_fs,
+        yuv,
+        output_frameno,
+      }];
+
+    crate::phasm_stego_lookahead::compute_distortion_scales_for_window(
+      &mut window,
+      inter_cfg,
+      bit_depth,
+    );
+
+    let crate::phasm_stego_lookahead::LookaheadWindowFrame {
+      fi: refined_fi,
+      fs: refined_fs,
+      ..
+    } = window.into_iter().next().expect("window had one entry");
+
+    *fi = refined_fi;
+    *fs = refined_fs;
+  }
+
   /// D.6 — multi-frame GOP encode with WriterTee recording for stego.
   ///
   /// Encodes `yuvs` as a single GOP: frame 0 is the keyframe, frames
@@ -145,6 +235,11 @@ pub mod phasm_stego {
   /// reordering would require `frame_q`-based delayed emission which
   /// the per-GOP stego flow can't accommodate. Output order = input
   /// order, no SEFs, no reorder.
+  ///
+  /// **P2 (2026-06-29):** when `PHASM_AV1_LOOKAHEAD=1` is set, each
+  /// frame's encode is preceded by a 1-frame lookahead refinement
+  /// pass via [`run_one_frame_lookahead`]. Default (env unset or 0)
+  /// is byte-identical to the pre-P2 baseline.
   pub fn encode_gop_with_phasm_tee<T: crate::util::Pixel>(
     yuvs: &[std::sync::Arc<crate::frame::Frame<T>>],
     config: std::sync::Arc<crate::api::EncoderConfig>,
@@ -152,6 +247,8 @@ pub mod phasm_stego {
   ) -> Vec<(Vec<u8>, PhasmFrameRecording<T>)> {
     assert!(!yuvs.is_empty(), "encode_gop_with_phasm_tee: empty GOP");
     let inter_cfg = make_inter_config(&config);
+    let lookahead = lookahead_enabled();
+    let bit_depth = config.bit_depth;
 
     let mut results = Vec::with_capacity(yuvs.len());
 
@@ -164,6 +261,16 @@ pub mod phasm_stego {
     );
     prev_fi.enable_segmentation = false;
     let mut fs = FrameState::new_with_frame(&prev_fi, yuvs[0].clone());
+    if lookahead {
+      run_one_frame_lookahead(
+        &mut prev_fi,
+        &mut fs,
+        std::sync::Arc::clone(&yuvs[0]),
+        0,
+        &inter_cfg,
+        bit_depth,
+      );
+    }
     let (packet, recording) =
       encode_frame_with_phasm_tee(&prev_fi, &mut fs, &inter_cfg);
     pad_and_update_ref(&mut prev_fi, &mut fs, 0);
@@ -189,6 +296,16 @@ pub mod phasm_stego {
       fi.set_ref_frame_sign_bias();
 
       let mut fs = FrameState::new_with_frame(&fi, yuv.clone());
+      if lookahead {
+        run_one_frame_lookahead(
+          &mut fi,
+          &mut fs,
+          std::sync::Arc::clone(yuv),
+          output_frameno_in_gop,
+          &inter_cfg,
+          bit_depth,
+        );
+      }
       let (packet, recording) =
         encode_frame_with_phasm_tee(&fi, &mut fs, &inter_cfg);
       pad_and_update_ref(&mut fi, &mut fs, output_frameno_in_gop);
